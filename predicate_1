@@ -3,15 +3,17 @@
 #
 #   OLD: send the FULL document (up to 12,000 chars) to the LLM once
 #        per document, ask for every linked entity.
-#   NEW: send ONLY the COMPLETE SENTENCE the <link> sits in (default).
-#        Short sentence (heading, bullet)? The neighbouring sentence is
-#        added until there is enough to read. Raw "6 words before/after"
-#        is still available as CONTEXT_MODE = "window", but it can cut
-#        a sentence in half, so it is NOT the default any more.
+#   NEW: send ONLY the hyperlink <Target> plus a few words around it:
+#            up to 6 words BEFORE + up to 6 words AFTER  (never fewer than 4,
+#            and the words stop at a sentence end when they can, so the snippet
+#            still reads as a meaningful phrase).
+#        Example snippet:  ... modified Rolls-Royce <Gas Turbine>. The definition of whole ...
 #        The LLM gets BOTH node names (SOURCE document + TARGET entity)
 #        and must return a meaningful predicate that reads as a true
 #        statement:   SOURCE --predicate--> TARGET
 #        plus a one-sentence description and a strength.
+#        Links of type "doc:wiki" are IGNORED (IGNORE_LINK_TYPES below).
+#        CONTEXT_MODE = "sentence" (whole sentence) is still available.
 #        Output columns are the SAME as before, so Cell 11 / 12 / 13
 #        keep working without changes.
 #
@@ -46,11 +48,13 @@ print("CELL 10 — LLM RELATIONSHIP EXTRACTION (token-light, per-link context)")
 print("=" * 80)
 
 # ---- Knobs ----------------------------------------------------------------
-CONTEXT_MODE       = "sentence" # "sentence" = full sentence around the <link>  (recommended)
-                                 # "window"   = raw N words each side (may cut a sentence)
-MIN_SENTENCE_WORDS = 10         # sentence shorter than this? add the neighbouring sentence(s)
-SENTENCE_MAX_WORDS = 60         # safety cap per side, so one endless sentence can't blow up tokens
-WINDOW_WORDS       = 6          # only used when CONTEXT_MODE = "window"
+CONTEXT_MODE       = "window"   # "window"   = words around the <link>   (default)
+                                 # "sentence" = the whole sentence around the <link>
+WINDOW_WORDS       = 6          # up to this many words BEFORE and AFTER the <link>
+MIN_WINDOW_WORDS   = 4          # never fewer than this per side (crosses a sentence end if needed)
+IGNORE_LINK_TYPES  = ("doc:wiki",)   # links of these types are NOT sent to the LLM; use () to keep all
+MIN_SENTENCE_WORDS = 10         # "sentence" mode only: shorter than this -> add neighbouring sentence
+SENTENCE_MAX_WORDS = 60         # "sentence" mode only: safety cap per side
 LINKS_PER_CALL     = 25         # snippets of ONE document per LLM call
 N_PARTITIONS       = 40         # parallel workers (raise toward your endpoint limit)
 DOCS_PER_CHUNK     = 2000       # a checkpoint is written after every chunk of docs
@@ -75,10 +79,11 @@ RECORD_DELIM = "##"
 SYSTEM_PROMPT = f"""You label relationships for a knowledge graph.
 
 You get a SOURCE document title and numbered items. Each item has a TARGET entity
-and a TEXT sentence from the SOURCE document where the TARGET appears (marked <Like This>).
+and a short TEXT snippet from the SOURCE document: a few words before and after the
+TARGET, which is marked <Like This>. The snippet may start or end mid-sentence.
 The graph edge is:   SOURCE --predicate--> TARGET
-Choose the predicate that makes this a TRUE, natural statement, using ONLY what the TEXT says.
-Do not rename or invent entities.
+Choose the predicate that makes this a TRUE, natural statement, using the SOURCE title
+and the TEXT snippet only. Do not invent facts, and do not rename or invent entities.
 
 Answer with one record per item, in the same order, formatted exactly as:
 NUMBER{TUPLE_DELIM}PREDICATE{TUPLE_DELIM}DESCRIPTION{TUPLE_DELIM}STRENGTH{RECORD_DELIM}
@@ -151,12 +156,16 @@ def _render_words(words, display, target):
 
 def _fallback_context(sentence, title):
     """Used only if a link can't be located in the full text: fall back to the
-    sentence from Cell 8b, trimmed to ~200 chars each side of the link."""
+    sentence from Cell 8b, trimmed to the same size as the normal context."""
     s = _sanitize_for_llm(sentence or "")
     marker = f"<{title}>"
     k = s.find(marker)
     if k < 0:
         return marker
+    if CONTEXT_MODE == "window":
+        before = s[:k].split()[-WINDOW_WORDS:]
+        after = s[k + len(marker):].split()[:WINDOW_WORDS]
+        return " ".join(before + [marker] + after)
     return s[max(0, k - 200): k + len(marker) + 200]
 
 
@@ -205,9 +214,22 @@ def _contexts_for_doc(doc_text, items):
                 if hi < len(words):
                     hi = _right_bound(words, hi)
             text = _render_words(words[lo:hi], display, occ)
-        else:  # window
-            lo = max(0, i - WINDOW_WORDS)
-            hi = min(len(words), i + WINDOW_WORDS + 1)
+        else:  # window: up to WINDOW_WORDS each side, at least MIN_WINDOW_WORDS
+            # BEFORE: walk back up to WINDOW_WORDS words, but stop at the start of the sentence...
+            lo_full = max(0, i - WINDOW_WORDS)
+            lo_clip = i
+            while lo_clip > lo_full and not _LEFT_END.search(words[lo_clip - 1]):
+                lo_clip -= 1
+            # ...yet never end up with fewer than MIN_WINDOW_WORDS words
+            lo = min(lo_clip, max(lo_full, i - MIN_WINDOW_WORDS))
+
+            # AFTER: same idea, forwards
+            hi_full = min(len(words), i + 1 + WINDOW_WORDS)
+            hi_clip = i
+            while hi_clip < hi_full - 1 and not _RIGHT_END.search(words[hi_clip]):
+                hi_clip += 1
+            hi = max(hi_clip + 1, min(len(words), i + 1 + MIN_WINDOW_WORDS))
+
             text = _render_words(words[lo:hi], display, occ)
             if lo > 0:
                 text = "... " + text
@@ -338,9 +360,15 @@ TRIPLES_SCHEMA = StructType([
 link_inputs = (
     sentences_df
     .filter(F.col("is_resolved"))
+    .filter(~F.col("link_type").isin(list(IGNORE_LINK_TYPES)) if IGNORE_LINK_TYPES else F.lit(True))
     .select("link_uid", "source_node", "source_title", "occurrence",
             "target_reference", "target_title", "link_type", "sentence")
 )
+
+if IGNORE_LINK_TYPES:
+    n_ignored = (sentences_df.filter(F.col("is_resolved"))
+                 .filter(F.col("link_type").isin(list(IGNORE_LINK_TYPES))).count())
+    print(f"Ignored link types {IGNORE_LINK_TYPES} : {n_ignored} links (not sent to the LLM)")
 
 # ---- Step 2: skip links already checkpointed (resumable) ------------------
 table_exists = spark.catalog.tableExists(CHECKPOINT_TABLE)
@@ -377,7 +405,7 @@ else:
     # ---- Step 4: PREVIEW real contexts + rough token estimate (no LLM) ------
     print()
     print(f"CONTEXT_MODE = {CONTEXT_MODE!r}"
-          + (f"  ({WINDOW_WORDS} words each side)" if CONTEXT_MODE == "window"
+          + (f"  (up to {WINDOW_WORDS} words each side, min {MIN_WINDOW_WORDS})" if CONTEXT_MODE == "window"
              else f"  (full sentence, min {MIN_SENTENCE_WORDS} words)"))
     print("Sample contexts (what the LLM will actually see):")
     print("-" * 80)
@@ -449,3 +477,62 @@ if spark.catalog.tableExists(CHECKPOINT_TABLE):
         "source_title", "predicate", "relationship_strength",
         "target_title", "relationship_description", "context_used", "link_type"
     ))
+
+    # ---- Step 7: readable table UNDER the code (wrapped text, no side-scroll) --
+    # display() above is the full interactive grid (sort / filter / download).
+    # This is the same data laid out as one easy-to-read table:
+    #     Source node --[predicate]--> Target node | why | sentence used
+    # The <Target> inside the sentence is highlighted in blue.
+    import html as _html
+
+    SHOW_ROWS = 50          # rows shown in the readable table (set None for all)
+
+    def _esc(x):
+        return _html.escape("" if x is None else str(x))
+
+    def _highlight(context, target):
+        """HTML-escape the sentence, then colour the <Target> the LLM was asked about."""
+        return _esc(context).replace(
+            _esc(f"<{target}>"),
+            f"<b style='color:#0645ad'>{_esc(target)}</b>",
+        )
+
+    def render_triples_table(rows):
+        head = ("<tr>" + "".join(
+            f"<th style='text-align:left;padding:6px 8px;background:#f1f3f5;"
+            f"border:1px solid #dee2e6'>{h}</th>"
+            for h in ["#", "Source node", "Predicate", "Target node",
+                      "Strength", "Why connected", "Sentence used"]) + "</tr>")
+        body = []
+        cell = "padding:6px 8px;border:1px solid #dee2e6;vertical-align:top;word-break:break-word"
+        for n, r in enumerate(rows, 1):
+            body.append(
+                "<tr>"
+                f"<td style='{cell}'>{n}</td>"
+                f"<td style='{cell}'>{_esc(r['source_title'])}</td>"
+                f"<td style='{cell};font-family:monospace;color:#2b8a3e'>{_esc(r['predicate'])}</td>"
+                f"<td style='{cell}'><b>{_esc(r['target_title'])}</b></td>"
+                f"<td style='{cell};text-align:center'>{_esc(r['relationship_strength'])}</td>"
+                f"<td style='{cell}'>{_esc(r['relationship_description'])}</td>"
+                f"<td style='{cell};font-size:12px;color:#495057'>"
+                f"{_highlight(r['context_used'], r['target_title'])}</td>"
+                "</tr>"
+            )
+        return (
+            "<div style='font-family:Arial,sans-serif;font-size:13px'>"
+            "<table style='border-collapse:collapse;width:100%;table-layout:fixed'>"
+            "<colgroup><col style='width:3%'><col style='width:15%'><col style='width:16%'>"
+            "<col style='width:12%'><col style='width:6%'><col style='width:20%'>"
+            "<col style='width:28%'></colgroup>"
+            f"{head}{''.join(body)}</table></div>"
+        )
+
+    _q = triples_df.select(
+        "source_title", "predicate", "target_title",
+        "relationship_strength", "relationship_description", "context_used",
+    ).orderBy("source_title", "target_title")
+    _rows = (_q if SHOW_ROWS is None else _q.limit(SHOW_ROWS)).collect()
+
+    print()
+    print(f"Readable table ({len(_rows)} of {n_total} rows):")
+    displayHTML(render_triples_table(_rows))
