@@ -1,5 +1,8 @@
 # ==========================================================
 # CELL 10 — ONE LINK = ONE LLM CALL
+# (FIXED: context window no longer runs away past bullet
+#  lists / missing punctuation — now a hard-capped 6-word
+#  window on each side, matching WINDOW_WORDS)
 # ==========================================================
 
 import re
@@ -20,7 +23,6 @@ print("=" * 70)
 
 CONTEXT_MODE = "window"
 WINDOW_WORDS = 6
-MIN_WINDOW_WORDS = 4
 IGNORE_LINK_TYPES = ("doc:wiki",)
 
 N_PARTITIONS = 1
@@ -112,9 +114,6 @@ _LINK_RE = re.compile(
 _SENTINEL_RE = re.compile(
     r"\ue000(\d+)\ue001"
 )
-
-_LEFT_END = re.compile(r"[.!?;:]$")
-_RIGHT_END = re.compile(r"[.!?;]$")
 
 
 # ----------------------------------------------------------
@@ -229,45 +228,17 @@ def _contexts_for_doc(doc_text, items):
 
         i = positions[occ]
 
-        # Before
-        lo = max(
-            0,
-            i - WINDOW_WORDS
-        )
+        # ------------------------------------------------
+        # FIXED WINDOW: exactly WINDOW_WORDS before/after.
+        # No more punctuation-hunting while-loops — those
+        # ran away across bullet ("*") separated text with
+        # no ".", "!", "?", ";" nearby, pulling in whole
+        # paragraphs instead of a short window. This is a
+        # hard, predictable cap that can never overrun.
+        # ------------------------------------------------
 
-        while (
-            lo < i
-            and not _LEFT_END.search(words[lo - 1])
-        ):
-            lo -= 1
-
-        lo = min(
-            lo,
-            max(
-                0,
-                i - MIN_WINDOW_WORDS
-            )
-        )
-
-        # After
-        hi = min(
-            len(words),
-            i + WINDOW_WORDS + 1
-        )
-
-        while (
-            hi > i + 1
-            and not _RIGHT_END.search(words[hi - 1])
-        ):
-            hi += 1
-
-        hi = max(
-            hi,
-            min(
-                len(words),
-                i + MIN_WINDOW_WORDS + 1
-            )
-        )
+        lo = max(0, i - WINDOW_WORDS)
+        hi = min(len(words), i + WINDOW_WORDS + 1)
 
         text = _render(
             words[lo:hi],
