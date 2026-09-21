@@ -463,76 +463,83 @@ else:
         print(f"Checkpointed to                  : {CHECKPOINT_TABLE}")
 
 # ---- Step 6: triples_df = the FULL accumulated result (Cell 11 reads this) --
+# NOTE: no .cache() -- serverless compute does not support it
+# ([NOT_SUPPORTED_WITH_SERVERLESS] PERSIST TABLE). Re-reading the Delta
+# table is cheap and never calls the LLM.
 if spark.catalog.tableExists(CHECKPOINT_TABLE):
-    # NOTE: no .cache() here -- serverless compute does not support it
-    # ([NOT_SUPPORTED_WITH_SERVERLESS] PERSIST TABLE). Reading the Delta
-    # table again is cheap and never calls the LLM.
     triples_df = spark.table(CHECKPOINT_TABLE)
     n_total = triples_df.count()
     print()
     print(f"triples_df (all runs combined) row count : {n_total}")
-    print()
-    print("Sample triples (source_title --[predicate, strength]--> target_title):")
-    display(triples_df.select(
-        "source_title", "predicate", "relationship_strength",
-        "target_title", "relationship_description", "context_used", "link_type"
-    ))
 
-    # ---- Step 7: readable table UNDER the code (wrapped text, no side-scroll) --
-    # display() above is the full interactive grid (sort / filter / download).
-    # This is the same data laid out as one easy-to-read table:
-    #     Source node --[predicate]--> Target node | why | sentence used
-    # The <Target> inside the sentence is highlighted in blue.
+    # ---- Step 7: ONE readable table right under the code, with ALL the data --
+    #   every row, every column (only the internal link_uid hash is left out):
+    #   Source node --[predicate]--> Target node | strength | why | sentence | link type
+    #   The <Target> inside the sentence is highlighted in blue; the document /
+    #   target reference ids are shown small and grey under each node title.
     import html as _html
 
-    SHOW_ROWS = 50          # rows shown in the readable table (set None for all)
+    SHOW_ROWS = None        # None = ALL rows.  Set a number (e.g. 50) to limit it.
 
     def _esc(x):
         return _html.escape("" if x is None else str(x))
 
     def _highlight(context, target):
-        """HTML-escape the sentence, then colour the <Target> the LLM was asked about."""
+        """HTML-escape the text, then colour the <Target> the LLM was asked about."""
         return _esc(context).replace(
             _esc(f"<{target}>"),
             f"<b style='color:#0645ad'>{_esc(target)}</b>",
         )
 
     def render_triples_table(rows):
-        head = ("<tr>" + "".join(
-            f"<th style='text-align:left;padding:6px 8px;background:#f1f3f5;"
-            f"border:1px solid #dee2e6'>{h}</th>"
-            for h in ["#", "Source node", "Predicate", "Target node",
-                      "Strength", "Why connected", "Sentence used"]) + "</tr>")
-        body = []
+        th = ("text-align:left;padding:6px 8px;background:#f1f3f5;"
+              "border:1px solid #dee2e6;position:sticky;top:0")
+        head = "<tr>" + "".join(
+            f"<th style='{th}'>{h}</th>"
+            for h in ["#", "Source node", "Predicate", "Target node", "Strength",
+                      "Why connected", "Sentence used", "Link type"]) + "</tr>"
         cell = "padding:6px 8px;border:1px solid #dee2e6;vertical-align:top;word-break:break-word"
+        ref  = "display:block;font-size:10px;color:#868e96;margin-top:2px"
+        body = []
         for n, r in enumerate(rows, 1):
             body.append(
                 "<tr>"
                 f"<td style='{cell}'>{n}</td>"
-                f"<td style='{cell}'>{_esc(r['source_title'])}</td>"
+                f"<td style='{cell}'>{_esc(r['source_title'])}"
+                f"<span style='{ref}'>{_esc(r['source_node'])}</span></td>"
                 f"<td style='{cell};font-family:monospace;color:#2b8a3e'>{_esc(r['predicate'])}</td>"
-                f"<td style='{cell}'><b>{_esc(r['target_title'])}</b></td>"
+                f"<td style='{cell}'><b>{_esc(r['target_title'])}</b>"
+                f"<span style='{ref}'>{_esc(r['target_reference'])}</span></td>"
                 f"<td style='{cell};text-align:center'>{_esc(r['relationship_strength'])}</td>"
                 f"<td style='{cell}'>{_esc(r['relationship_description'])}</td>"
                 f"<td style='{cell};font-size:12px;color:#495057'>"
                 f"{_highlight(r['context_used'], r['target_title'])}</td>"
+                f"<td style='{cell};font-size:11px'>{_esc(r['link_type'])}</td>"
                 "</tr>"
             )
         return (
             "<div style='font-family:Arial,sans-serif;font-size:13px'>"
             "<table style='border-collapse:collapse;width:100%;table-layout:fixed'>"
-            "<colgroup><col style='width:3%'><col style='width:15%'><col style='width:16%'>"
-            "<col style='width:12%'><col style='width:6%'><col style='width:20%'>"
-            "<col style='width:28%'></colgroup>"
+            "<colgroup><col style='width:3%'><col style='width:14%'><col style='width:14%'>"
+            "<col style='width:13%'><col style='width:5%'><col style='width:19%'>"
+            "<col style='width:25%'><col style='width:7%'></colgroup>"
             f"{head}{''.join(body)}</table></div>"
         )
 
     _q = triples_df.select(
-        "source_title", "predicate", "target_title",
-        "relationship_strength", "relationship_description", "context_used",
+        "source_title", "source_node", "predicate", "target_title", "target_reference",
+        "relationship_strength", "relationship_description", "context_used", "link_type",
     ).orderBy("source_title", "target_title")
     _rows = (_q if SHOW_ROWS is None else _q.limit(SHOW_ROWS)).collect()
 
     print()
-    print(f"Readable table ({len(_rows)} of {n_total} rows):")
+    print(f"TABLE -- source node --[predicate]--> target node   ({len(_rows)} of {n_total} rows)")
     displayHTML(render_triples_table(_rows))
+
+    # same data as an interactive grid (sort / filter / download) -- below the table
+    print()
+    print("Interactive grid (sort / filter / download):")
+    display(triples_df.select(
+        "source_title", "predicate", "relationship_strength",
+        "target_title", "relationship_description", "context_used", "link_type"
+    ))
