@@ -436,7 +436,10 @@ else:
 
 # ---- Step 6: triples_df = the FULL accumulated result (Cell 11 reads this) --
 if spark.catalog.tableExists(CHECKPOINT_TABLE):
-    triples_df = spark.table(CHECKPOINT_TABLE).cache()
+    # NOTE: no .cache() here -- serverless compute does not support it
+    # ([NOT_SUPPORTED_WITH_SERVERLESS] PERSIST TABLE). Reading the Delta
+    # table again is cheap and never calls the LLM.
+    triples_df = spark.table(CHECKPOINT_TABLE)
     n_total = triples_df.count()
     print()
     print(f"triples_df (all runs combined) row count : {n_total}")
