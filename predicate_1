@@ -1,595 +1,634 @@
 # ==========================================================
-# CELL 10 — LLM RELATIONSHIP EXTRACTION
-# 1 TARGET -> 1 SENTENCE -> 1 LLM CALL -> 1 PREDICATE
+# Cell 10 : LOCAL-CONTEXT LLM RELATIONSHIP EXTRACTION
+#
+# PURPOSE
+# -------
+# For EACH hyperlink occurrence:
+#
+#   Source Document
+#        |
+#        | predicate
+#        v
+#   Target Entity
+#
+# The LLM DOES NOT receive the entire XML document.
+#
+# It receives only:
+#   1. Source document title
+#   2. Target entity
+#   3. The sentence containing the hyperlink
+#      OR approximately 6 words before + 6 words after
+#
+# This makes predicate extraction depend on the LOCAL meaning
+# around the hyperlink instead of unrelated content elsewhere
+# in the 20k-document XML.
+#
+# Needs:
+#   - sentences_df       (Cell 8b)
+#
+# Does NOT need:
+#   - document_rendered_df
+#
 # ==========================================================
 
 import re
-import time
 
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
 from pyspark.sql.types import (
-    StructType, StructField,
-    StringType, IntegerType
+    StructType,
+    StructField,
+    StringType,
+    IntegerType
 )
 
 print("=" * 80)
-print("CELL 10 — ITERATIVE LLM RELATIONSHIP EXTRACTION")
+print("CELL 10 — LOCAL-CONTEXT LLM RELATIONSHIP EXTRACTION")
 print("=" * 80)
 
-# ----------------------------------------------------------
-# 1. REQUIRED INPUTS
-# ----------------------------------------------------------
 
-_required = [
-    "sentences_df",
-    "document_rendered_df",
-    "DEPLOYMENT_NAME",
-    "DATABRICKS_TOKEN",
-]
+# ==========================================================
+# 1. CONFIGURATION
+# ==========================================================
 
-_missing = [x for x in _required if x not in globals()]
+N_PARTITIONS = 40
 
-if _missing:
-    raise RuntimeError(
-        f"Missing required variables: {_missing}. "
-        "Required: Cell 8b, Cell 8d and LLM initialization."
-    )
+# Maximum number of words sent around the hyperlink
+CONTEXT_WORDS = 6
 
-# ----------------------------------------------------------
-# 2. CONFIG
-# ----------------------------------------------------------
+# If sentence is short, use complete sentence.
+# If sentence is longer, use local 6-before / 6-after context.
+MAX_FULL_SENTENCE_WORDS = 30
 
-N_PARTITIONS = 16
-CHUNK_TARGETS = 500
-
+# IMPORTANT:
+# Use a NEW checkpoint table because the previous Cell 10
+# checkpoint contains document-level relationships.
 CHECKPOINT_TABLE = (
     "knwbt_airr_foundry_dev_catalog.secured."
-    "kg_relationship_checkpoint_cell10_v2"
+    "kg_relationship_checkpoint_local_context"
 )
 
-LLM_MAX_RETRIES = 6
-LLM_TIMEOUT_SECONDS = 60
-LLM_MAX_TOKENS = 200
-RETRY_SLEEP_SECONDS = 2
 
-LOCAL_CONTEXT_WORDS = 6
-MAX_SENTENCE_CHARS = 4000
-MAX_EVIDENCE_CHARS = 1500
-
-RETRY_FAILED = True
+# ==========================================================
+# 2. LLM CONNECTION CONFIGURATION
+# ==========================================================
 
 _CONN = {
     "model": DEPLOYMENT_NAME,
     "base_url": (
-        "https://adb-3955688708870984.4."
-        "azuredatabricks.net/serving-endpoints"
+        "https://adb-3955688708870984.4.azuredatabricks.net/"
+        "serving-endpoints"
     ),
     "api_key": DATABRICKS_TOKEN,
 }
 
+
+# ==========================================================
+# 3. OUTPUT DELIMITERS
+# ==========================================================
+
 TUPLE_DELIM = "<|>"
 RECORD_DELIM = "##"
 
-# ----------------------------------------------------------
-# 3. SYSTEM PROMPT
-# ----------------------------------------------------------
+
+# ==========================================================
+# 4. SYSTEM PROMPT
+# ==========================================================
 
 SYSTEM_PROMPT = f"""
-You extract ONE semantic relationship for a knowledge graph.
+---Role---
 
-INPUT:
-1. SOURCE document title.
-2. ONE TARGET entity.
-3. FULL SENTENCE containing the target.
-4. LOCAL CONTEXT of approximately six words before and after target.
+You are an AI assistant extracting relationships for a knowledge graph.
 
-IMPORTANT:
-- There is ONLY ONE target.
-- Return ONLY ONE predicate.
-- Do not identify additional entities.
-- Do not create additional graph nodes.
-- Do not create multiple predicates.
-- Do not invent relationships.
 
-SOURCE:
-The SOURCE is the document title.
+---Goal---
 
-TARGET:
-The TARGET is the explicitly supplied entity.
+You are given:
 
-DIRECTION:
-SOURCE -> predicate -> TARGET
+1. A SOURCE document/entity.
+2. ONE TARGET entity represented by a hyperlink.
+3. ONLY the local textual context surrounding that hyperlink.
 
-The full sentence is the primary evidence.
-The local context provides additional focused evidence.
+Your job is to determine WHY the source and target are connected
+based ONLY on the provided local context.
 
-PREDICATE:
-- exactly one
-- lowercase
-- snake_case
-- 1 to 5 words
-- grounded in the sentence
+DO NOT use knowledge outside the provided context.
+
+DO NOT assume relationships that are not supported by the text.
+
+
+---IMPORTANT CONTEXT RULE---
+
+The provided context is intentionally small.
+
+It contains either:
+
+- the complete sentence containing the hyperlink, OR
+- approximately 6 words before and 6 words after the hyperlink.
+
+The target entity is represented using <Entity Name>.
+
+Focus primarily on the words surrounding <Entity Name>.
+
+
+---Predicate rules---
+
+Return exactly ONE predicate.
+
+The predicate must:
+
+- be lowercase
+- use snake_case
+- contain 1-5 words
+- contain no spaces
+- contain no hyphens
 
 Examples:
-uses
+
+works_at
+is_defined_by
+is_part_of
 depends_on
+is_subject_to
+uses
 contains
-supports
-belongs_to
-controlled_by
-mentions
 related_to
 
-If merely referenced/listed: mentions
-If genuinely unclear: related_to
 
-STRENGTH:
-Return integer 1-10.
+---Very important---
 
-OUTPUT EXACTLY:
-<Entity Name>{TUPLE_DELIM}<predicate>{TUPLE_DELIM}<description>{TUPLE_DELIM}<strength>{RECORD_DELIM}
+Do NOT invent a specific relationship if the context does not
+clearly support one.
+
+If the relationship is unclear or only generally associated,
+return:
+
+related_to
+
+
+---Description---
+
+Give a short explanation of WHY the source and target are connected.
+
+The explanation must be based ONLY on the provided context.
+
+Do not use information from outside the context.
+
+
+---Strength---
+
+Return an integer from 1 to 10.
+
+10 = very explicit relationship
+8-9 = strong relationship
+5-7 = reasonably clear relationship
+3-4 = weak relationship
+1-2 = very unclear/incidental
+
+
+---Output format---
+
+Return EXACTLY:
+
+<entity name>{TUPLE_DELIM}<predicate>{TUPLE_DELIM}<description>{TUPLE_DELIM}<strength>{RECORD_DELIM}
 
 No JSON.
 No markdown.
 No additional explanation.
 """
 
-# ----------------------------------------------------------
-# 4. TEXT HELPERS
-# ----------------------------------------------------------
 
-_UNRESOLVED_MARKUP_RE = re.compile(
-    r"\[?<doc:(?:wiki:)?[^<>]+>\]?"
-)
+# ==========================================================
+# 5. PREDICATE NORMALIZATION
+# ==========================================================
 
-_LINK_RE = re.compile(r"<[^<>]+>")
+def _to_snake_case(s):
 
+    s = s.strip().lower()
 
-def _sanitize_text(text):
-    text = text or ""
-    text = _UNRESOLVED_MARKUP_RE.sub(" ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def _target_pattern(target_title):
-    words = (target_title or "").split()
-
-    if not words:
-        return None
-
-    return re.compile(
-        r"<\s*" +
-        r"\s+".join(re.escape(w) for w in words) +
-        r"\s*>",
-        re.IGNORECASE
-    )
-
-
-def _prepare_document(content):
-    text = _sanitize_text(content)
-
-    masked = _LINK_RE.sub(
-        lambda m: "x" * len(m.group(0)),
-        text
-    )
-
-    return text, masked
-
-
-# ----------------------------------------------------------
-# 5. FIND SENTENCE CONTAINING TARGET
-# ----------------------------------------------------------
-
-def _find_sentence_for_target(prepared_document, target_title):
-
-    text, masked = prepared_document
-
-    if not text:
-        return ""
-
-    pattern = _target_pattern(target_title)
-
-    if pattern is None:
-        return ""
-
-    match = pattern.search(text)
-
-    if not match:
-        return ""
-
-    start = match.start()
-    end = match.end()
-
-    sentence_start = 0
-
-    for i in range(start - 1, -1, -1):
-        if masked[i] in ".!?":
-            sentence_start = i + 1
-            break
-
-    sentence_end = len(text)
-
-    for i in range(end, len(text)):
-        if masked[i] in ".!?":
-            sentence_end = i + 1
-            break
-
-    return text[sentence_start:sentence_end].strip()
-
-
-# ----------------------------------------------------------
-# 6. LOCAL CONTEXT
-# ----------------------------------------------------------
-
-def _extract_local_context(sentence, target_title):
-
-    if not sentence:
-        return ""
-
-    pattern = _target_pattern(target_title)
-
-    if pattern is None:
-        return ""
-
-    match = pattern.search(sentence)
-
-    if not match:
-        return ""
-
-    before = (
-        sentence[:match.start()]
-        .split()[-LOCAL_CONTEXT_WORDS:]
-    )
-
-    after = (
-        sentence[match.end():]
-        .split()[:LOCAL_CONTEXT_WORDS]
-    )
-
-    return " ".join(
-        before +
-        [match.group(0)] +
-        after
-    )
-
-
-def _build_target_context(prepared_document, target_title):
-
-    sentence = _find_sentence_for_target(
-        prepared_document,
-        target_title
-    )
-
-    if not sentence:
-        return "", ""
-
-    local_context = _extract_local_context(
-        sentence,
-        target_title
-    )
-
-    if len(sentence) > MAX_SENTENCE_CHARS:
-
-        pattern = _target_pattern(target_title)
-        match = pattern.search(sentence) if pattern else None
-
-        if match:
-            center = match.start()
-            half = MAX_SENTENCE_CHARS // 2
-            start = max(0, center - half)
-            end = min(
-                len(sentence),
-                start + MAX_SENTENCE_CHARS
-            )
-            sentence = sentence[start:end]
-        else:
-            sentence = sentence[:MAX_SENTENCE_CHARS]
-
-    return sentence, local_context
-
-
-# ----------------------------------------------------------
-# 7. PREDICATE NORMALIZATION
-# ----------------------------------------------------------
-
-_PREDICATE_ALIASES = {
-    "is_related_to": "related_to",
-    "relates_to": "related_to",
-    "refers_to": "mentions",
-    "references": "mentions",
-    "utilizes": "uses",
-    "utilises": "uses",
-    "relies_on": "depends_on",
-    "is_dependent_on": "depends_on",
-}
-
-
-def _normalize_predicate(predicate):
-
-    predicate = (predicate or "").strip().lower()
-
-    predicate = re.sub(
+    s = re.sub(
         r"[^a-z0-9]+",
         "_",
-        predicate
+        s
     )
 
-    predicate = re.sub(
+    s = re.sub(
         r"_+",
         "_",
-        predicate
-    ).strip("_")
-
-    predicate = predicate or "related_to"
-
-    predicate = _PREDICATE_ALIASES.get(
-        predicate,
-        predicate
+        s
     )
 
-    words = predicate.split("_")
+    s = s.strip("_")
 
-    if len(words) > 5:
-        predicate = "_".join(words[:5])
-
-    return predicate or "related_to"
+    return s or "related_to"
 
 
-# ----------------------------------------------------------
-# 8. PARSE LLM RESPONSE
-# ----------------------------------------------------------
+# ==========================================================
+# 6. PARSE LLM RESPONSE
+# ==========================================================
 
-def _parse_llm_response(response_text):
+def _parse_record(text, entity_name):
 
-    if not response_text:
+    if not text:
         return (
             "related_to",
             "",
-            1,
-            "parse_error"
+            5
         )
 
-    record = (
-        response_text
-        .split(RECORD_DELIM)[0]
-        .strip()
-    )
+    # We expect:
+    #
+    # entity<|>predicate<|>description<|>strength##
+
+    record = text.split(RECORD_DELIM)[0].strip()
 
     parts = [
-        x.strip()
-        for x in record.split(TUPLE_DELIM)
+        p.strip()
+        for p in record.split(TUPLE_DELIM)
     ]
 
-    if len(parts) < 3:
+    if len(parts) < 2:
         return (
             "related_to",
-            f"[Unparseable response: {response_text[:300]}]",
-            1,
-            "parse_error"
+            "",
+            5
         )
 
-    predicate = _normalize_predicate(parts[1])
-    description = parts[2]
+    predicate = _to_snake_case(
+        parts[1]
+    )
 
-    strength = 5
+    description = (
+        parts[2]
+        if len(parts) > 2
+        else ""
+    )
 
-    if len(parts) >= 4:
-        match = re.search(r"\d+", parts[3])
+    try:
 
-        if match:
-            strength = max(
-                1,
-                min(10, int(match.group()))
-            )
+        strength_text = (
+            parts[3]
+            if len(parts) > 3
+            else "5"
+        )
+
+        numbers = re.findall(
+            r"\d+",
+            strength_text
+        )
+
+        strength = (
+            int(numbers[0])
+            if numbers
+            else 5
+        )
+
+        strength = max(
+            1,
+            min(10, strength)
+        )
+
+    except Exception:
+
+        strength = 5
 
     return (
         predicate,
         description,
-        strength,
-        "ok"
+        strength
     )
 
 
-# ----------------------------------------------------------
-# 9. ONE TARGET -> ONE LLM CALL
-# ----------------------------------------------------------
+# ==========================================================
+# 7. LOCAL CONTEXT EXTRACTION
+# ==========================================================
+#
+# Example sentence:
+#
+# The process is a sub-set of the total workflow needed to
+# completely define the fluid system of a new or modified
+# Rolls-Royce <Gas Turbine>.
+#
+# We do NOT send the entire document.
+#
+# We create:
+#
+# fluid system of a new or modified Rolls-Royce <Gas Turbine>
+#
+# or similar local context.
+#
+# ==========================================================
 
-def _extract_one_target(
-    llm,
-    source_title,
-    prepared_document,
-    target_title
+def _local_context(
+    sentence,
+    target_title,
+    context_words=6,
+    max_full_sentence_words=30
 ):
 
-    sentence, local_context = _build_target_context(
-        prepared_document,
-        target_title
-    )
+    if not sentence:
+        return ""
+
+    sentence = re.sub(
+        r"\s+",
+        " ",
+        str(sentence)
+    ).strip()
 
     if not sentence:
-        return {
-            "predicate": "related_to",
-            "description": (
-                "[No sentence containing target hyperlink was found]"
-            ),
-            "strength": 1,
-            "status": "no_sentence",
-            "evidence_sentence": "",
-        }
+        return ""
 
-    user_prompt = f"""
-SOURCE DOCUMENT TITLE:
-{source_title}
+    # ------------------------------------------------------
+    # Find the target represented as:
+    #
+    # <Gas Turbine>
+    #
+    # ------------------------------------------------------
 
-TARGET ENTITY:
-{target_title}
+    target_pattern = re.compile(
+        r"<\s*"
+        + re.escape(target_title.strip())
+        + r"\s*>",
+        flags=re.IGNORECASE
+    )
 
-FULL SENTENCE CONTAINING THE TARGET:
-{sentence}
+    match = target_pattern.search(sentence)
 
-FOCUSED LOCAL CONTEXT:
-{local_context}
+    # ------------------------------------------------------
+    # If target cannot be located, safely use the sentence.
+    # ------------------------------------------------------
 
-TASK:
-Determine the ONE semantic relationship:
+    if not match:
+        return sentence
 
-SOURCE:
-{source_title}
+    # ------------------------------------------------------
+    # Tokenize while preserving the target as one token.
+    #
+    # Example:
+    #
+    # ["fluid", "system", "of", "a", "new", "or",
+    #  "modified", "Rolls-Royce", "<Gas Turbine>"]
+    # ------------------------------------------------------
 
-TARGET:
-{target_title}
+    before = sentence[:match.start()].strip()
+    after = sentence[match.end():].strip()
 
-The SOURCE is the subject.
-The TARGET is the object.
+    before_words = before.split()
+    after_words = after.split()
 
-Use the full sentence as primary evidence.
-Use local context as additional evidence.
+    # ------------------------------------------------------
+    # If sentence is short, use the ENTIRE sentence.
+    # ------------------------------------------------------
 
-Return exactly ONE predicate.
-"""
+    total_words = (
+        len(before_words)
+        + 1
+        + len(after_words)
+    )
 
-    last_error = None
+    if total_words <= max_full_sentence_words:
 
-    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        return sentence
 
-        try:
+    # ------------------------------------------------------
+    # Otherwise take:
+    #
+    # 6 words BEFORE
+    # +
+    # TARGET
+    # +
+    # 6 words AFTER
+    # ------------------------------------------------------
 
-            response = llm.invoke([
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
-            ])
+    before_context = before_words[
+        -context_words:
+    ]
 
-            response_text = (
-                getattr(response, "content", "")
-                or ""
-            )
+    after_context = after_words[
+        :context_words
+    ]
 
-            (
-                predicate,
-                description,
-                strength,
-                status,
-            ) = _parse_llm_response(
-                response_text
-            )
+    local = (
+        before_context
+        + [f"<{target_title}>"]
+        + after_context
+    )
 
-            return {
-                "predicate": predicate,
-                "description": description,
-                "strength": strength,
-                "status": status,
-                "evidence_sentence":
-                    sentence[:MAX_EVIDENCE_CHARS],
-            }
-
-        except Exception as e:
-
-            last_error = e
-
-            if attempt < LLM_MAX_RETRIES:
-                time.sleep(
-                    RETRY_SLEEP_SECONDS * attempt
-                )
-
-    return {
-        "predicate": "related_to",
-        "description": (
-            f"[extraction failed: "
-            f"{type(last_error).__name__}: "
-            f"{str(last_error)[:300]}]"
-        ),
-        "strength": 1,
-        "status": "failed",
-        "evidence_sentence":
-            sentence[:MAX_EVIDENCE_CHARS],
-    }
+    return " ".join(local)
 
 
-# ----------------------------------------------------------
-# 10. DISTRIBUTED WORKER
-# ----------------------------------------------------------
+# ==========================================================
+# 8. DISTRIBUTED LLM WORKER
+# ==========================================================
 
 def process_partition_pandas(pdf_iterator):
 
     import pandas as pd
+
     from langchain_openai import ChatOpenAI
+
+
+    # ------------------------------------------------------
+    # Create one LLM client per partition
+    # ------------------------------------------------------
 
     partition_llm = ChatOpenAI(
         model=_CONN["model"],
         base_url=_CONN["base_url"],
         api_key=_CONN["api_key"],
         temperature=0,
-        max_retries=0,
-        timeout=LLM_TIMEOUT_SECONDS,
-        max_tokens=LLM_MAX_TOKENS,
     )
 
+
+    # ------------------------------------------------------
+    # Output columns
+    # ------------------------------------------------------
+
     out_columns = [
+
+        "link_uid",
+
         "source_node",
+
         "source_title",
+
         "predicate",
+
         "relationship_description",
+
         "relationship_strength",
+
         "target_title",
+
         "target_reference",
+
         "link_type",
-        "status",
-        "evidence_sentence",
-        "mention_count",
+
+        "context_used",
+
     ]
+
+
+    # ------------------------------------------------------
+    # Process Arrow batches
+    # ------------------------------------------------------
 
     for pdf in pdf_iterator:
 
         out_rows = []
 
+
+        # --------------------------------------------------
+        # Process every hyperlink occurrence
+        # --------------------------------------------------
+
         for _, row in pdf.iterrows():
 
+            source_node = row["source_node"]
+
             source_title = row["source_title"]
-            content = row["content_with_titles"]
-            entities = row["entities"]
 
-            prepared_document = _prepare_document(
-                content
-            )
+            target_title = row["target_title"]
 
-            for entity in entities:
+            target_reference = row["target_reference"]
 
-                target_title = entity["target_title"]
+            link_type = row["link_type"]
 
-                result = _extract_one_target(
-                    partition_llm,
-                    source_title,
-                    prepared_document,
-                    target_title
+            link_uid = row["link_uid"]
+
+            sentence = row["sentence"]
+
+
+            try:
+
+                # ------------------------------------------
+                # Create LOCAL context
+                # ------------------------------------------
+
+                context = _local_context(
+                    sentence=sentence,
+                    target_title=target_title,
+                    context_words=CONTEXT_WORDS,
+                    max_full_sentence_words=MAX_FULL_SENTENCE_WORDS
                 )
 
-                out_rows.append({
-                    "source_node": source_title,
-                    "source_title": source_title,
-                    "predicate": result["predicate"],
-                    "relationship_description":
-                        result["description"],
-                    "relationship_strength":
-                        result["strength"],
-                    "target_title": target_title,
-                    "target_reference":
-                        entity["target_reference"],
-                    "link_type":
-                        entity["link_type"],
-                    "status": result["status"],
-                    "evidence_sentence":
-                        result["evidence_sentence"],
-                    "mention_count":
-                        int(entity["mention_count"]),
-                })
+
+                # ------------------------------------------
+                # Build LLM prompt
+                # ------------------------------------------
+
+                user_prompt = f"""
+SOURCE ENTITY:
+{source_title}
+
+TARGET ENTITY:
+<{target_title}>
+
+LOCAL CONTEXT:
+{context}
+
+Determine the single predicate connecting the
+SOURCE ENTITY and TARGET ENTITY based ONLY
+on this local context.
+
+Return exactly one record:
+
+<{target_title}>{TUPLE_DELIM}<predicate>{TUPLE_DELIM}<description>{TUPLE_DELIM}<strength>{RECORD_DELIM}
+"""
+
+
+                # ------------------------------------------
+                # LLM call
+                # ------------------------------------------
+
+                resp = partition_llm.invoke(
+                    [
+                        {
+                            "role": "system",
+                            "content": SYSTEM_PROMPT,
+                        },
+                        {
+                            "role": "user",
+                            "content": user_prompt,
+                        },
+                    ]
+                )
+
+
+                # ------------------------------------------
+                # Parse response
+                # ------------------------------------------
+
+                predicate, description, strength = (
+                    _parse_record(
+                        resp.content.strip(),
+                        target_title
+                    )
+                )
+
+
+            except Exception as e:
+
+                # ------------------------------------------
+                # One bad hyperlink must NOT stop the job.
+                # ------------------------------------------
+
+                predicate = "related_to"
+
+                description = (
+                    f"[extraction failed: {e}]"
+                )
+
+                strength = 1
+
+                context = (
+                    sentence
+                    if sentence
+                    else ""
+                )
+
+
+            # ----------------------------------------------
+            # Save result
+            # ----------------------------------------------
+
+            out_rows.append({
+
+                "link_uid":
+                    link_uid,
+
+                "source_node":
+                    source_node,
+
+                "source_title":
+                    source_title,
+
+                "predicate":
+                    predicate,
+
+                "relationship_description":
+                    description,
+
+                "relationship_strength":
+                    strength,
+
+                "target_title":
+                    target_title,
+
+                "target_reference":
+                    target_reference,
+
+                "link_type":
+                    link_type,
+
+                "context_used":
+                    context,
+
+            })
+
+
+        # --------------------------------------------------
+        # ALWAYS yield correct schema
+        # --------------------------------------------------
 
         yield pd.DataFrame(
             out_rows,
@@ -597,365 +636,337 @@ def process_partition_pandas(pdf_iterator):
         )
 
 
-# ----------------------------------------------------------
-# 11. OUTPUT SCHEMA
-# ----------------------------------------------------------
+# ==========================================================
+# 9. OUTPUT SCHEMA
+# ==========================================================
 
 TRIPLES_SCHEMA = StructType([
-    StructField("source_node", StringType()),
-    StructField("source_title", StringType()),
-    StructField("predicate", StringType()),
-    StructField("relationship_description", StringType()),
-    StructField("relationship_strength", IntegerType()),
-    StructField("target_title", StringType()),
-    StructField("target_reference", StringType()),
-    StructField("link_type", StringType()),
-    StructField("status", StringType()),
-    StructField("evidence_sentence", StringType()),
-    StructField("mention_count", IntegerType()),
+
+    StructField(
+        "link_uid",
+        StringType()
+    ),
+
+    StructField(
+        "source_node",
+        StringType()
+    ),
+
+    StructField(
+        "source_title",
+        StringType()
+    ),
+
+    StructField(
+        "predicate",
+        StringType()
+    ),
+
+    StructField(
+        "relationship_description",
+        StringType()
+    ),
+
+    StructField(
+        "relationship_strength",
+        IntegerType()
+    ),
+
+    StructField(
+        "target_title",
+        StringType()
+    ),
+
+    StructField(
+        "target_reference",
+        StringType()
+    ),
+
+    StructField(
+        "link_type",
+        StringType()
+    ),
+
+    StructField(
+        "context_used",
+        StringType()
+    ),
+
 ])
 
-# ----------------------------------------------------------
-# 12. RESOLVED TARGETS
-# ----------------------------------------------------------
 
-print("=" * 80)
-print("BUILDING DOCUMENT-TARGET WORK ITEMS")
-print("=" * 80)
+# ==========================================================
+# 10. INPUT DATA
+# ==========================================================
+#
+# IMPORTANT CHANGE:
+#
+# OLD:
+#   document -> collect_list(all targets)
+#
+# NEW:
+#   ONE ROW = ONE HYPERLINK OCCURRENCE
+#
+# Therefore the LLM sees the local context for each hyperlink.
+#
+# ==========================================================
 
-resolved_occurrences = (
+predicate_inputs = (
+
     sentences_df
-    .filter(F.col("is_resolved") == True)
-    .filter(F.col("target_title").isNotNull())
-    .filter(F.trim(F.col("target_title")) != "")
-)
 
-KEY_COLS = [
-    "source_node",
-    "target_title"
-]
-
-mention_counts = (
-    resolved_occurrences
-    .groupBy(*KEY_COLS)
-    .agg(
-        F.count(F.lit(1))
-        .cast("int")
-        .alias("mention_count")
+    .filter(
+        F.col("is_resolved")
     )
-)
 
-first_window = (
-    Window
-    .partitionBy(*KEY_COLS)
-    .orderBy(F.col("occurrence").asc())
-)
-
-targets_all = (
-    resolved_occurrences
-    .withColumn(
-        "_rn",
-        F.row_number().over(first_window)
-    )
-    .filter(F.col("_rn") == 1)
-    .drop("_rn")
-    .join(
-        mention_counts,
-        on=KEY_COLS,
-        how="left"
-    )
     .select(
+        "link_uid",
         "source_node",
         "source_title",
         "target_reference",
         "target_title",
         "link_type",
-        "mention_count"
-    )
-)
-
-print(
-    f"Resolved occurrences : "
-    f"{resolved_occurrences.count()}"
-)
-
-print(
-    f"Document-target pairs : "
-    f"{mention_counts.count()}"
-)
-
-# ----------------------------------------------------------
-# 13. CHECKPOINT
-# ----------------------------------------------------------
-
-table_exists = spark.catalog.tableExists(
-    CHECKPOINT_TABLE
-)
-
-if table_exists:
-
-    checkpoint_df = spark.table(
-        CHECKPOINT_TABLE
+        "sentence"
     )
 
-    if "status" in checkpoint_df.columns:
+    .filter(
+        F.col("target_title").isNotNull()
+    )
 
-        if RETRY_FAILED:
+)
 
-            already_done = (
-                checkpoint_df
-                .filter(F.col("status") == "ok")
-                .select(*KEY_COLS)
-                .distinct()
-            )
 
-            failed_count = (
-                checkpoint_df
-                .filter(F.col("status") == "failed")
-                .select(*KEY_COLS)
-                .distinct()
-                .count()
-            )
+# ==========================================================
+# 11. SHOW SAMPLE INPUT BEFORE LLM
+# ==========================================================
 
-            print(
-                f"Previously failed targets: {failed_count}"
-            )
+print()
+print("=" * 80)
+print("SAMPLE LOCAL CONTEXT INPUT")
+print("=" * 80)
 
-        else:
+display(
 
-            already_done = (
-                checkpoint_df
-                .select(*KEY_COLS)
-                .distinct()
-            )
+    predicate_inputs
 
-    else:
+    .select(
+        "source_title",
+        "target_title",
+        "sentence"
+    )
 
-        already_done = (
-            checkpoint_df
-            .select(*KEY_COLS)
-            .distinct()
+    .limit(10)
+
+)
+
+
+# ==========================================================
+# 12. CHECKPOINTING
+# ==========================================================
+#
+# IMPORTANT:
+#
+# We checkpoint by link_uid, NOT source_node.
+#
+# This is important because one document can contain
+# many hyperlinks.
+#
+# ==========================================================
+
+try:
+
+    already_done = (
+
+        spark.table(
+            CHECKPOINT_TABLE
         )
 
-    targets_to_process = (
-        targets_all
+        .select(
+            "link_uid"
+        )
+
+        .distinct()
+    )
+
+
+    n_already_done = (
+        already_done.count()
+    )
+
+
+    predicate_inputs = (
+
+        predicate_inputs
+
         .join(
             already_done,
-            on=KEY_COLS,
+            on="link_uid",
             how="left_anti"
         )
+
+    )
+
+
+    print(
+        f"Already checkpointed links : "
+        f"{n_already_done}"
+    )
+
+
+except Exception:
+
+    print(
+        "No existing local-context checkpoint "
+        f"table found."
     )
 
     print(
-        f"Checkpointed targets skipped: "
-        f"{already_done.count()}"
-    )
-
-else:
-
-    targets_to_process = targets_all
-
-    print("No checkpoint table found.")
-    print("Starting new checkpoint.")
-
-n_to_process = targets_to_process.count()
-
-print(
-    f"Targets to process: {n_to_process}"
-)
-
-# ----------------------------------------------------------
-# 14. CHUNK PROCESSING
-# ----------------------------------------------------------
-
-if n_to_process > 0:
-
-    n_chunks = max(
-        1,
-        (n_to_process + CHUNK_TARGETS - 1)
-        // CHUNK_TARGETS
-    )
-
-    chunked = (
-        targets_to_process
-        .withColumn(
-            "_chunk_id",
-            F.pmod(
-                F.hash(*KEY_COLS),
-                F.lit(n_chunks)
-            )
-        )
-    )
-
-    print(
-        f"Total chunks: {n_chunks}"
-    )
-
-    rows_before = (
-        spark.table(CHECKPOINT_TABLE).count()
-        if table_exists
-        else 0
-    )
-
-    for chunk_id in range(n_chunks):
-
-        print(
-            f"Processing chunk "
-            f"{chunk_id + 1}/{n_chunks}"
-        )
-
-        chunk_targets = (
-            chunked
-            .filter(
-                F.col("_chunk_id") == chunk_id
-            )
-            .drop("_chunk_id")
-        )
-
-        chunk_doc_entities = (
-            chunk_targets
-            .groupBy(
-                "source_node",
-                "source_title"
-            )
-            .agg(
-                F.collect_list(
-                    F.struct(
-                        "target_title",
-                        "target_reference",
-                        "link_type",
-                        "mention_count",
-                    )
-                ).alias("entities")
-            )
-        )
-
-        chunk_input = (
-            chunk_doc_entities
-            .join(
-                document_rendered_df.select(
-                    "source_node",
-                    "content_with_titles",
-                ),
-                on="source_node",
-                how="inner"
-            )
-        )
-
-        (
-            chunk_input
-            .repartition(N_PARTITIONS)
-            .mapInPandas(
-                process_partition_pandas,
-                schema=TRIPLES_SCHEMA
-            )
-            .write
-            .mode("append")
-            .option("mergeSchema", "true")
-            .saveAsTable(CHECKPOINT_TABLE)
-        )
-
-        print(
-            f"Chunk {chunk_id + 1}/{n_chunks} saved."
-        )
-
-    rows_after = (
-        spark.table(CHECKPOINT_TABLE).count()
-    )
-
-    print(
-        f"Rows written this run: "
-        f"{rows_after - rows_before}"
-    )
-
-else:
-
-    print(
-        "Nothing to process. "
-        "All targets are already checkpointed."
-    )
-
-# ----------------------------------------------------------
-# 15. LOAD FINAL RESULTS
-# ----------------------------------------------------------
-
-if not spark.catalog.tableExists(
-    CHECKPOINT_TABLE
-):
-    raise RuntimeError(
-        f"Checkpoint table does not exist: "
+        f"Starting fresh at: "
         f"{CHECKPOINT_TABLE}"
     )
 
-triples_all_df = spark.table(
-    CHECKPOINT_TABLE
+
+# ==========================================================
+# 13. COUNT WORK
+# ==========================================================
+
+n_links_to_process = (
+    predicate_inputs.count()
 )
 
-if "status" in triples_all_df.columns:
+print(
+    f"Hyperlink occurrences to process : "
+    f"{n_links_to_process}"
+)
 
-    triples_df = (
-        triples_all_df
-        .filter(F.col("status") == "ok")
+
+# ==========================================================
+# 14. DISTRIBUTED LLM EXTRACTION
+# ==========================================================
+
+if n_links_to_process == 0:
+
+    print()
+    print(
+        "Nothing to do -- all hyperlink "
+        "occurrences are already checkpointed."
     )
 
 else:
 
-    triples_df = triples_all_df
+    print()
+    print(
+        "Starting distributed local-context "
+        "predicate extraction..."
+    )
 
-# ----------------------------------------------------------
-# IMPORTANT:
-# NO CACHE USED
-# ----------------------------------------------------------
 
-n_all = triples_all_df.count()
-n_usable = triples_df.count()
+    new_triples_df = (
 
-print("=" * 80)
-print("CELL 10 COMPLETE")
-print("=" * 80)
+        predicate_inputs
 
-print(
-    f"All checkpoint rows : {n_all}"
-)
+        .repartition(
+            N_PARTITIONS
+        )
 
-print(
-    f"Usable triples_df   : {n_usable}"
-)
+        .mapInPandas(
+            process_partition_pandas,
+            schema=TRIPLES_SCHEMA
+        )
 
-if "status" in triples_all_df.columns:
+    )
 
-    display(
-        triples_all_df
-        .groupBy("status")
-        .count()
-        .orderBy(
-            F.col("count").desc()
+
+    # ======================================================
+    # 15. CHECKPOINT RESULTS
+    # ======================================================
+
+    (
+        new_triples_df.write
+
+        .mode("append")
+
+        .option(
+            "mergeSchema",
+            "true"
+        )
+
+        .saveAsTable(
+            CHECKPOINT_TABLE
         )
     )
 
-print("Top predicates:")
 
-display(
-    triples_df
-    .groupBy("predicate")
-    .count()
-    .orderBy(
-        F.col("count").desc()
+    n_new = (
+        new_triples_df.count()
     )
-    .limit(25)
+
+
+    print()
+    print(
+        f"Relationships extracted : "
+        f"{n_new}"
+    )
+
+    print(
+        f"Checkpoint table : "
+        f"{CHECKPOINT_TABLE}"
+    )
+
+
+# ==========================================================
+# 16. LOAD ALL RELATIONSHIPS
+# ==========================================================
+
+triples_df = (
+
+    spark.table(
+        CHECKPOINT_TABLE
+    )
+
+    .cache()
+
 )
 
-print("Sample triples:")
+
+n_total = (
+    triples_df.count()
+)
+
+
+print()
+print("=" * 80)
+print("FINAL LOCAL-CONTEXT RELATIONSHIPS")
+print("=" * 80)
+
+print(
+    f"Total relationships : "
+    f"{n_total}"
+)
+
+
+# ==========================================================
+# 17. DISPLAY RESULTS
+# ==========================================================
 
 display(
+
     triples_df.select(
+
         "source_title",
+
         "predicate",
+
         "relationship_strength",
+
         "target_title",
+
         "relationship_description",
-        "link_type",
-        "mention_count",
-        "evidence_sentence",
+
+        "context_used",
+
+        "link_type"
+
     )
+
 )
