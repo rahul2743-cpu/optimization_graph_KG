@@ -1,422 +1,364 @@
 # ==========================================================
-# CELL 10 — ONE LINK = ONE LLM CALL
-# (FIXED: context window no longer runs away past bullet
-#  lists / missing punctuation — now a hard-capped 6-word
-#  window on each side, matching WINDOW_WORDS)
+# GENERIC LINK -> RELATIONSHIP EXTRACTION
+# One link = one LLM call. Checkpointed, resumable, concurrent.
+#
+# Nothing environment-specific is hardcoded: endpoint, model,
+# tables, column names, link markup, prompt wording, predicate
+# rules and concurrency are all driven by ExtractionConfig /
+# ColumnMap (see the usage example at the bottom).
 # ==========================================================
 
-import re
 import math
-from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StructType, StructField, StringType, IntegerType
+import re
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Tuple
+
+
+# ----------------------------------------------------------
+# 1. CONFIG
+# ----------------------------------------------------------
+
+LINK_FIELDS = (
+    "link_uid", "source_node", "source_title", "occurrence",
+    "target_reference", "target_title", "link_type", "sentence",
 )
-
-print("=" * 70)
-print("CELL 10 — ONE DOCUMENT -> ONE LINK -> ONE LLM CALL")
-print("=" * 70)
-
-
-# ----------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------
-
-CONTEXT_MODE = "window"
-WINDOW_WORDS = 6
-IGNORE_LINK_TYPES = ("doc:wiki",)
-
-N_PARTITIONS = 1
-DOCS_PER_CHUNK = 2000
-DRY_RUN = False
-
-CHECKPOINT_TABLE = (
-    "knwbt_airr_foundry_dev_catalog.secured."
-    "kg_relationship_checkpoint_ctx"
-)
-
-
-# ----------------------------------------------------------
-# LLM CONNECTION
-# ----------------------------------------------------------
-
-_CONN = {
-    "model": DEPLOYMENT_NAME,
-    "base_url": (
-        "https://adb-3955688708870984.4.azuredatabricks.net/"
-        "serving-endpoints"
-    ),
-    "api_key": DATABRICKS_TOKEN,
-}
-
-
-TUPLE_DELIM = "<|>"
-RECORD_DELIM = "##"
-
-
-# ----------------------------------------------------------
-# LLM PROMPT
-# ----------------------------------------------------------
-
-SYSTEM_PROMPT = f"""
-You label ONE relationship for a knowledge graph.
-
-SOURCE = source document.
-TARGET = linked entity.
-TEXT = short context around the TARGET.
-
-The graph edge is:
-
-SOURCE --predicate--> TARGET
-
-Choose a specific predicate that makes this a TRUE natural statement.
-
-Return exactly:
-
-1{TUPLE_DELIM}PREDICATE{TUPLE_DELIM}DESCRIPTION{TUPLE_DELIM}STRENGTH{RECORD_DELIM}
-
-Rules:
-
-PREDICATE:
-- snake_case
-- 2-5 words
-- specific relationship
-- NEVER use related_to, mentions, references, has_link
-
-DESCRIPTION:
-- one complete sentence
-- maximum 25 words
-
-STRENGTH:
-- integer 1-10
-- 10 = explicit/central
-- 1 = passing mention
-
-No JSON.
-No markdown.
-No extra text.
-"""
-
-
-# ----------------------------------------------------------
-# REGEX
-# ----------------------------------------------------------
-
-_UNRESOLVED_MARKUP_RE = re.compile(
-    r"\[?<doc:(?:wiki:)?[^<>]+>\]?"
-)
-
-_LINK_RE = re.compile(
-    r"\[(?:(?P<label>[^<>\[\]]+?)\s+)?"
-    r"<doc:(?:wiki:)?[^>]+>\]"
-    r"|<(?P<title>[^<>]+)>"
-)
-
-_SENTINEL_RE = re.compile(
-    r"\ue000(\d+)\ue001"
-)
-
-
-# ----------------------------------------------------------
-# HELPERS
-# ----------------------------------------------------------
-
-def _sanitize(text):
-    return re.sub(
-        r"\s+",
-        " ",
-        _UNRESOLVED_MARKUP_RE.sub(" ", text or "")
-    ).strip()
-
-
-def _to_snake_case(s):
-    s = re.sub(
-        r"[^a-z0-9]+",
-        "_",
-        s.strip().lower()
-    )
-    return re.sub(
-        r"_+",
-        "_",
-        s
-    ).strip("_") or "related_to"
-
-
-def _tokenize_doc(text):
-
-    display = []
-
-    def repl(m):
-        title = m.group("title")
-        display.append(
-            title if title is not None
-            else (m.group("label") or "")
-        )
-        return f"\ue000{len(display)-1}\ue001"
-
-    return _LINK_RE.sub(repl, text or "").split(), display
-
-
-def _render(words, display, target):
-
-    def sub(m):
-        k = int(m.group(1))
-        return (
-            f"<{display[k]}>"
-            if k == target
-            else display[k]
-        )
-
-    return re.sub(
-        r"\s+",
-        " ",
-        " ".join(
-            _SENTINEL_RE.sub(sub, w)
-            for w in words
-        )
-    ).strip()
-
-
-def _fallback(sentence, title):
-
-    s = _sanitize(sentence)
-    marker = f"<{title}>"
-    k = s.find(marker)
-
-    if k < 0:
-        return marker
-
-    before = s[:k].split()[-WINDOW_WORDS:]
-    after = s[k + len(marker):].split()[:WINDOW_WORDS]
-
-    return " ".join(
-        before + [marker] + after
-    )
-
-
-def _contexts_for_doc(doc_text, items):
-
-    words, display = _tokenize_doc(doc_text)
-
-    positions = {}
-
-    for i, word in enumerate(words):
-        for m in _SENTINEL_RE.finditer(word):
-            positions.setdefault(
-                int(m.group(1)),
-                i
-            )
-
-    contexts = []
-
-    for item in items:
-
-        occ = item["occurrence"]
-        title = item["target_title"]
-
-        if (
-            occ is None
-            or occ not in positions
-            or display[occ] != title
-        ):
-            contexts.append(
-                _fallback(
-                    item["sentence"],
-                    title
-                )
-            )
-            continue
-
-        i = positions[occ]
-
-        # ------------------------------------------------
-        # FIXED WINDOW: exactly WINDOW_WORDS before/after.
-        # No more punctuation-hunting while-loops — those
-        # ran away across bullet ("*") separated text with
-        # no ".", "!", "?", ";" nearby, pulling in whole
-        # paragraphs instead of a short window. This is a
-        # hard, predictable cap that can never overrun.
-        # ------------------------------------------------
-
-        lo = max(0, i - WINDOW_WORDS)
-        hi = min(len(words), i + WINDOW_WORDS + 1)
-
-        text = _render(
-            words[lo:hi],
-            display,
-            occ
-        )
-
-        if lo > 0:
-            text = "... " + text
-
-        if hi < len(words):
-            text += " ..."
-
-        contexts.append(text)
-
-    return contexts
-
-
-def _parse_one(text):
-
-    parts = [
-        p.strip()
-        for p in text
-        .split(RECORD_DELIM)[0]
-        .strip()
-        .split(TUPLE_DELIM)
-    ]
-
-    if len(parts) < 3:
-        return None
-
-    predicate = _to_snake_case(parts[1])
-
-    if len(parts) >= 4:
-        description = TUPLE_DELIM.join(parts[2:-1])
-        strength_text = parts[-1]
-    else:
-        description = parts[2]
-        strength_text = ""
-
-    match = re.search(
-        r"\d+",
-        strength_text
-    )
-
-    strength = (
-        max(
-            1,
-            min(10, int(match.group()))
-        )
-        if match
-        else 5
-    )
-
-    return predicate, description, strength
-
-
-# ----------------------------------------------------------
-# OUTPUT SCHEMA
-# ----------------------------------------------------------
 
 OUT_COLUMNS = [
-    "link_uid",
-    "source_node",
-    "source_title",
-    "predicate",
-    "relationship_description",
-    "relationship_strength",
-    "target_title",
-    "target_reference",
-    "link_type",
-    "context_used",
+    "link_uid", "source_node", "source_title", "predicate",
+    "relationship_description", "relationship_strength",
+    "target_title", "target_reference", "link_type", "context_used",
 ]
 
 
-TRIPLES_SCHEMA = StructType([
-    StructField("link_uid", StringType()),
-    StructField("source_node", StringType()),
-    StructField("source_title", StringType()),
-    StructField("predicate", StringType()),
-    StructField("relationship_description", StringType()),
-    StructField("relationship_strength", IntegerType()),
-    StructField("target_title", StringType()),
-    StructField("target_reference", StringType()),
-    StructField("link_type", StringType()),
-    StructField("context_used", StringType()),
-])
+@dataclass
+class ColumnMap:
+    """Map YOUR column names -> the canonical names used internally."""
+    # links dataframe
+    link_uid: str = "link_uid"
+    source_node: str = "source_node"
+    source_title: str = "source_title"
+    occurrence: str = "occurrence"          # index of the link within its doc
+    target_reference: str = "target_reference"
+    target_title: str = "target_title"
+    link_type: str = "link_type"
+    sentence: str = "sentence"              # fallback context if no occurrence
+    # documents dataframe (joined to links on `source_node`)
+    doc_text: str = "doc_text"
 
 
-# ==========================================================
-# LLM PROCESSING
-# ONE DOCUMENT -> ONE LINK -> ONE LLM CALL
-# ==========================================================
+@dataclass
+class ExtractionConfig:
+    # ---- required ----
+    model: str
+    base_url: str                 # any OpenAI-compatible endpoint
+    api_key: str
+    checkpoint_table: str         # catalog.schema.table (append-only)
 
-def process_partition_pandas(pdf_iterator):
+    # ---- LLM ----
+    temperature: Optional[float] = 0.0   # None = don't send (some models reject it)
+    timeout: int = 120
+    max_retries: int = 3
+    # Optional: bring your own client. Called as llm_factory(cfg); the returned
+    # object must expose .invoke(messages) -> object with .content
+    llm_factory: Optional[Callable] = None
 
-    import pandas as pd
+    # ---- which links to process ----
+    link_filter: Optional[str] = None            # SQL expr on ORIGINAL columns, e.g. "is_resolved"
+    ignore_link_types: Tuple[str, ...] = ()
+
+    # ---- context window around the link ----
+    window_words: int = 6
+    skip_symbol_tokens: bool = True              # bullets/pipes/dashes don't use up the word budget
+    skip_links_without_context: bool = False     # skip links where only "<Title>" is available
+    # Link markup. Must define named groups `label` and/or `title`.
+    link_pattern: str = (
+        r"\[(?:(?P<label>[^<>\[\]]+?)\s+)?<doc:(?:wiki:)?[^>]+>\]"
+        r"|<(?P<title>[^<>]+)>"
+    )
+    unresolved_markup_pattern: str = r"\[?<doc:(?:wiki:)?[^<>]+>\]?"
+
+    # ---- prompt / output format ----
+    system_prompt: Optional[str] = None          # full override; else built from fields below
+    user_prompt_template: str = "SOURCE: {source}\n\nTARGET: {target}\n\nTEXT:\n{text}"
+    source_label: str = "source document"
+    target_label: str = "linked entity"
+    tuple_delim: str = "<|>"
+    record_delim: str = "##"
+    banned_predicates: Tuple[str, ...] = ("related_to", "mentions", "references", "has_link")
+    allowed_predicates: Optional[Tuple[str, ...]] = None   # controlled vocabulary (optional)
+    predicate_min_words: int = 2
+    predicate_max_words: int = 5
+    max_description_words: int = 25
+    strength_min: int = 1
+    strength_max: int = 10
+
+    # ---- execution ----
+    n_partitions: int = 1
+    max_workers: int = 8                         # concurrent LLM calls per partition
+    docs_per_chunk: int = 200                    # a chunk is written atomically -> keep small
+    max_error_rate: float = 0.2                  # abort partition if exceeded...
+    min_calls_for_error_check: int = 20          # ...after at least this many calls
+
+
+_SENT_OPEN, _SENT_CLOSE = "\ue000", "\ue001"
+_SENTINEL_RE = re.compile(_SENT_OPEN + r"(\d+)" + _SENT_CLOSE)
+
+
+# ----------------------------------------------------------
+# 2. PROMPT
+# ----------------------------------------------------------
+
+def build_system_prompt(cfg: ExtractionConfig) -> str:
+    if cfg.system_prompt:
+        return cfg.system_prompt
+
+    d = cfg.tuple_delim
+    lines = [
+        "You label ONE relationship for a knowledge graph.",
+        "",
+        f"SOURCE = the {cfg.source_label}.",
+        f"TARGET = the {cfg.target_label}.",
+        "TEXT = short context around the TARGET. The TARGET appears in TEXT "
+        "wrapped in <angle brackets>. '...' means the text was truncated.",
+        "",
+        "The graph edge is:  SOURCE --predicate--> TARGET",
+        "Choose a specific predicate that makes this a TRUE natural statement.",
+        "",
+        "Return exactly one line:",
+        f"PREDICATE{d}DESCRIPTION{d}STRENGTH{cfg.record_delim}",
+        "",
+        "PREDICATE:",
+        f"- snake_case, {cfg.predicate_min_words}-{cfg.predicate_max_words} words",
+        "- a specific relationship",
+        f"- NEVER use: {', '.join(cfg.banned_predicates)}",
+    ]
+    if cfg.allowed_predicates:
+        lines.append("- MUST be exactly one of: " + ", ".join(cfg.allowed_predicates))
+    lines += [
+        "",
+        "DESCRIPTION:",
+        f"- one complete sentence, maximum {cfg.max_description_words} words",
+        "",
+        "STRENGTH:",
+        f"- integer {cfg.strength_min}-{cfg.strength_max}",
+        f"- {cfg.strength_max} = explicit/central, {cfg.strength_min} = passing mention",
+        "",
+        "No JSON. No markdown. No extra text.",
+    ]
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------
+# 3. CONTEXT BUILDER
+# ----------------------------------------------------------
+
+class ContextBuilder:
+    def __init__(self, cfg: ExtractionConfig):
+        self.cfg = cfg
+        self.link_re = re.compile(cfg.link_pattern)
+        self.unresolved_re = re.compile(cfg.unresolved_markup_pattern)
+
+    def _sanitize(self, text):
+        return re.sub(r"\s+", " ", self.unresolved_re.sub(" ", text or "")).strip()
+
+    def _tokenize(self, text):
+        display = []
+
+        def repl(m):
+            groups = m.groupdict()
+            title = groups.get("title")
+            display.append(title if title is not None else (groups.get("label") or ""))
+            return f"{_SENT_OPEN}{len(display) - 1}{_SENT_CLOSE}"
+
+        return self.link_re.sub(repl, text or "").split(), display
+
+    @staticmethod
+    def _render(words, display, target):
+        def sub(m):
+            k = int(m.group(1))
+            return f"<{display[k]}>" if k == target else display[k]
+
+        return re.sub(
+            r"\s+", " ", " ".join(_SENTINEL_RE.sub(sub, w) for w in words)
+        ).strip()
+
+    def _counts(self, token):
+        return (not self.cfg.skip_symbol_tokens) or bool(re.search(r"\w", token))
+
+    def _bounds(self, words, i):
+        """Hard-capped window: at most `window_words` counted words per side."""
+        n = self.cfg.window_words
+        lo, seen = i, 0
+        while lo > 0 and seen < n:
+            lo -= 1
+            seen += self._counts(words[lo])
+        hi, seen = i + 1, 0
+        while hi < len(words) and seen < n:
+            seen += self._counts(words[hi])
+            hi += 1
+        return lo, hi
+
+    def _fallback(self, sentence, title):
+        s = self._sanitize(sentence)
+        marker = f"<{title}>"
+        k = s.find(marker)
+        if k < 0:
+            return marker
+        n = self.cfg.window_words
+        before = s[:k].split()[-n:] if n else []
+        after = s[k + len(marker):].split()[:n]
+        return " ".join(before + [marker] + after)
+
+    def contexts_for_doc(self, doc_text, items) -> List[str]:
+        words, display = self._tokenize(doc_text)
+
+        positions = {}
+        for i, w in enumerate(words):
+            for m in _SENTINEL_RE.finditer(w):
+                positions.setdefault(int(m.group(1)), i)
+
+        out = []
+        for item in items:
+            occ, title = item["occurrence"], item["target_title"]
+            if occ is None or occ not in positions or display[occ] != title:
+                out.append(self._fallback(item["sentence"], title))
+                continue
+            lo, hi = self._bounds(words, positions[occ])
+            text = self._render(words[lo:hi], display, occ)
+            if lo > 0:
+                text = "... " + text
+            if hi < len(words):
+                text += " ..."
+            out.append(text)
+        return out
+
+
+# ----------------------------------------------------------
+# 4. RESPONSE PARSER  (strict: bad output is rejected, not guessed)
+# ----------------------------------------------------------
+
+class RelationshipParser:
+    def __init__(self, cfg: ExtractionConfig):
+        self.cfg = cfg
+        self.banned = {b.lower() for b in cfg.banned_predicates}
+        self.allowed = (
+            {a.lower() for a in cfg.allowed_predicates} if cfg.allowed_predicates else None
+        )
+
+    @staticmethod
+    def to_snake_case(s):
+        return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", (s or "").strip().lower())).strip("_")
+
+    def parse(self, text) -> Optional[Tuple[str, str, int]]:
+        cfg = self.cfg
+        parts = [
+            p.strip()
+            for p in (text or "").split(cfg.record_delim)[0].strip().split(cfg.tuple_delim)
+        ]
+        # tolerate a stray leading record index ("1<|>pred<|>desc<|>7")
+        if len(parts) >= 4 and parts[0].isdigit():
+            parts = parts[1:]
+        if len(parts) < 3:
+            return None
+
+        predicate = self.to_snake_case(parts[0])
+        description = cfg.tuple_delim.join(parts[1:-1]).strip()
+        m = re.search(r"\d+", parts[-1])
+
+        if not predicate or not description or not m:
+            return None
+        if predicate in self.banned:
+            return None
+        if not (cfg.predicate_min_words <= len(predicate.split("_")) <= cfg.predicate_max_words):
+            return None
+        if self.allowed is not None and predicate not in self.allowed:
+            return None
+
+        strength = max(cfg.strength_min, min(cfg.strength_max, int(m.group())))
+        return predicate, description, strength
+
+
+# ----------------------------------------------------------
+# 5. WORKER  (runs on executors via mapInPandas)
+# ----------------------------------------------------------
+
+def _build_llm(cfg: ExtractionConfig):
+    if cfg.llm_factory is not None:
+        return cfg.llm_factory(cfg)
     from langchain_openai import ChatOpenAI
 
-    llm = ChatOpenAI(
-        model=_CONN["model"],
-        base_url=_CONN["base_url"],
-        api_key=_CONN["api_key"],
-        temperature=0,
-        max_retries=3,
-        timeout=120,
+    kwargs = dict(
+        model=cfg.model,
+        base_url=cfg.base_url,
+        api_key=cfg.api_key,
+        max_retries=cfg.max_retries,
+        timeout=cfg.timeout,
     )
+    if cfg.temperature is not None:
+        kwargs["temperature"] = cfg.temperature
+    return ChatOpenAI(**kwargs)
 
-    for pdf in pdf_iterator:
 
-        results = []
+def make_partition_fn(cfg: ExtractionConfig):
+    """Returns the function handed to mapInPandas (cfg is captured in the closure)."""
 
-        # ======================================================
-        # DOCUMENT LOOP
-        # ======================================================
+    def process(pdf_iterator):
+        import pandas as pd
 
-        for _, row in pdf.iterrows():
+        llm = _build_llm(cfg)
+        ctx = ContextBuilder(cfg)
+        parser = RelationshipParser(cfg)
+        system_prompt = build_system_prompt(cfg)
 
-            items = list(row["items"])
+        n_total = n_err = n_parse_fail = 0
+        last_err = None
 
-            contexts = _contexts_for_doc(
-                row["content_with_titles"],
-                items
+        def call(job):
+            source_node, source_title, item, context = job
+            user = cfg.user_prompt_template.format(
+                source=source_title, target=item["target_title"], text=context
             )
+            try:
+                resp = llm.invoke([
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user},
+                ])
+                content = resp.content if isinstance(resp.content, str) else str(resp.content)
+                return job, parser.parse(content), None
+            except Exception as e:  # noqa: BLE001 - counted and surfaced below
+                return job, None, repr(e)
 
-            # ==================================================
-            # LINK LOOP
-            #
-            # ONE LINK = ONE LLM CALL
-            # ==================================================
+        with ThreadPoolExecutor(max_workers=max(1, cfg.max_workers)) as pool:
+            for pdf in pdf_iterator:
+                jobs = []
+                for _, row in pdf.iterrows():
+                    items = list(row["items"])
+                    contexts = ctx.contexts_for_doc(row["doc_text"], items)
+                    for item, context in zip(items, contexts):
+                        if (
+                            cfg.skip_links_without_context
+                            and context.strip() == f"<{item['target_title']}>"
+                        ):
+                            continue  # not checkpointed; costs nothing to re-skip
+                        jobs.append((row["source_node"], row["source_title"], item, context))
 
-            for item, context in zip(
-                items,
-                contexts
-            ):
-
-                prompt = f"""
-SOURCE: {row['source_title']}
-
-TARGET: {item['target_title']}
-
-TEXT:
-{context}
-"""
-
-                try:
-
-                    response = llm.invoke([
-                        {
-                            "role": "system",
-                            "content": SYSTEM_PROMPT
-                        },
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ])
-
-                    content = (
-                        response.content
-                        if isinstance(
-                            response.content,
-                            str
-                        )
-                        else str(response.content)
-                    )
-
-                    parsed = _parse_one(content)
-
-                    if parsed is None:
+                results = []
+                for job, parsed, err in pool.map(call, jobs):
+                    n_total += 1
+                    if err is not None:
+                        n_err += 1
+                        last_err = err
                         continue
-
+                    if parsed is None:
+                        n_parse_fail += 1
+                        continue
+                    source_node, source_title, item, context = job
                     predicate, description, strength = parsed
-
                     results.append({
                         "link_uid": item["link_uid"],
-                        "source_node": row["source_node"],
-                        "source_title": row["source_title"],
+                        "source_node": source_node,
+                        "source_title": source_title,
                         "predicate": predicate,
                         "relationship_description": description,
                         "relationship_strength": strength,
@@ -426,189 +368,155 @@ TEXT:
                         "context_used": context,
                     })
 
-                except Exception:
-                    # Failed link is NOT saved.
-                    # It will be retried next run.
-                    continue
+                # Fail loudly instead of "completing" with nothing written.
+                if (
+                    n_total >= cfg.min_calls_for_error_check
+                    and n_err / n_total > cfg.max_error_rate
+                ):
+                    raise RuntimeError(
+                        f"LLM error rate {n_err}/{n_total} exceeds "
+                        f"{cfg.max_error_rate:.0%}. Last error: {last_err}"
+                    )
 
-        yield pd.DataFrame(
-            results,
-            columns=OUT_COLUMNS
-        )
+                # Failed / unparseable links are simply NOT written, so the
+                # checkpoint anti-join retries them on the next run.
+                yield pd.DataFrame(results, columns=OUT_COLUMNS)
 
+        if n_parse_fail:
+            print(f"[partition] unparseable LLM responses: {n_parse_fail}/{n_total}")
 
-# ==========================================================
-# SPARK INPUT
-# ==========================================================
-
-link_inputs = (
-    sentences_df
-    .filter(F.col("is_resolved"))
-    .filter(
-        ~F.col("link_type").isin(
-            list(IGNORE_LINK_TYPES)
-        )
-        if IGNORE_LINK_TYPES
-        else F.lit(True)
-    )
-    .select(
-        "link_uid",
-        "source_node",
-        "source_title",
-        "occurrence",
-        "target_reference",
-        "target_title",
-        "link_type",
-        "sentence"
-    )
-)
+    return process
 
 
-# ==========================================================
-# CHECKPOINT — SKIP ALREADY PROCESSED LINKS
-# ==========================================================
+# ----------------------------------------------------------
+# 6. ORCHESTRATION
+# ----------------------------------------------------------
 
-table_exists = spark.catalog.tableExists(
-    CHECKPOINT_TABLE
-)
+def _out_schema():
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
 
-if table_exists:
-
-    done = (
-        spark.table(CHECKPOINT_TABLE)
-        .select("link_uid")
-        .distinct()
-    )
-
-    link_inputs = link_inputs.join(
-        done,
-        on="link_uid",
-        how="left_anti"
-    )
+    return StructType([
+        StructField(n, IntegerType() if n == "relationship_strength" else StringType())
+        for n in OUT_COLUMNS
+    ])
 
 
-n_links_todo = link_inputs.count()
-
-print(
-    f"Links remaining: {n_links_todo}"
-)
-
-
-# ==========================================================
-# GROUP LINKS BY DOCUMENT
-# ==========================================================
-
-doc_batches = (
-    link_inputs
-    .groupBy(
-        "source_node",
-        "source_title"
-    )
-    .agg(
-        F.collect_list(
-            F.struct(
-                "link_uid",
-                "occurrence",
-                "target_title",
-                "target_reference",
-                "link_type",
-                "sentence"
-            )
-        ).alias("items")
-    )
-    .join(
-        document_rendered_df.select(
-            "source_node",
-            "content_with_titles"
-        ),
-        on="source_node",
-        how="inner"
-    )
-)
-
-
-# ==========================================================
-# RUN LLM EXTRACTION
-# ==========================================================
-
-if n_links_todo > 0 and not DRY_RUN:
-
-    n_docs = doc_batches.count()
-
-    n_chunks = max(
-        1,
-        math.ceil(
-            n_docs / DOCS_PER_CHUNK
-        )
-    )
-
-    doc_batches = doc_batches.withColumn(
-        "_chunk",
-        F.pmod(
-            F.xxhash64("source_node"),
-            F.lit(n_chunks)
-        )
-    )
-
-    for c in range(n_chunks):
-
-        (
-            doc_batches
-            .filter(
-                F.col("_chunk") == c
-            )
-            .drop("_chunk")
-            .repartition(N_PARTITIONS)
-            .mapInPandas(
-                process_partition_pandas,
-                schema=TRIPLES_SCHEMA
-            )
-            .write
-            .mode("append")
-            .option(
-                "mergeSchema",
-                "true"
-            )
-            .saveAsTable(
-                CHECKPOINT_TABLE
-            )
-        )
-
-    print(
-        "LLM extraction completed."
-    )
-
-
-# ==========================================================
-# FINAL TABLE ONLY
-# ==========================================================
-
-if spark.catalog.tableExists(
-    CHECKPOINT_TABLE
+def run_relationship_extraction(
+    spark,
+    links_df,
+    docs_df,
+    cfg: ExtractionConfig,
+    columns: Optional[ColumnMap] = None,
+    dry_run: bool = False,
 ):
+    """
+    links_df : one row per link (see ColumnMap for expected columns)
+    docs_df  : one row per source document (source_node + doc_text)
+    Returns the checkpoint table as a DataFrame (or None if it doesn't exist).
+    """
+    from pyspark.sql import functions as F
 
-    triples_df = spark.table(
-        CHECKPOINT_TABLE
-    )
+    cm = columns or ColumnMap()
 
-    display(
-        triples_df.select(
-            "source_title",
-            "predicate",
-            "target_title",
-            "relationship_strength",
-            "relationship_description",
-            "context_used",
-            "link_type"
+    # ---- select + normalise input ----
+    links = links_df.filter(cfg.link_filter) if cfg.link_filter else links_df
+    links = links.select(*[F.col(getattr(cm, k)).alias(k) for k in LINK_FIELDS])
+
+    if cfg.ignore_link_types:
+        # coalesce: NULL link_type must not be silently dropped by NOT IN
+        links = links.filter(
+            ~F.coalesce(F.col("link_type"), F.lit("")).isin(list(cfg.ignore_link_types))
         )
-        .orderBy(
-            "source_title",
-            "target_title"
+    links = links.dropDuplicates(["link_uid"])
+
+    docs = (
+        docs_df
+        .select(
+            F.col(cm.source_node).alias("source_node"),
+            F.col(cm.doc_text).alias("doc_text"),
         )
+        .dropDuplicates(["source_node"])
     )
 
-else:
+    # ---- checkpoint: skip links that are already done ----
+    if spark.catalog.tableExists(cfg.checkpoint_table):
+        done = spark.table(cfg.checkpoint_table).select("link_uid").distinct()
+        links = links.join(done, on="link_uid", how="left_anti")
 
-    print(
-        "No relationships found."
+    n_links_todo = links.count()
+    print(f"Links remaining: {n_links_todo}")
+
+    # ---- one row per document, carrying all its links ----
+    doc_batches = (
+        links.groupBy("source_node", "source_title")
+        .agg(
+            F.collect_list(
+                F.struct(
+                    "link_uid", "occurrence", "target_title",
+                    "target_reference", "link_type", "sentence",
+                )
+            ).alias("items")
+        )
+        .join(docs, on="source_node", how="inner")
     )
+
+    # ---- run ----
+    if n_links_todo > 0 and not dry_run:
+        n_docs = doc_batches.count()
+        n_chunks = max(1, math.ceil(n_docs / cfg.docs_per_chunk))
+        doc_batches = doc_batches.withColumn(
+            "_chunk", F.pmod(F.xxhash64("source_node"), F.lit(n_chunks))
+        )
+        fn = make_partition_fn(cfg)
+        schema = _out_schema()
+
+        for c in range(n_chunks):
+            (
+                doc_batches.filter(F.col("_chunk") == c)
+                .drop("_chunk")
+                .repartition(cfg.n_partitions)
+                .mapInPandas(fn, schema=schema)
+                .write.mode("append")
+                .option("mergeSchema", "true")
+                .saveAsTable(cfg.checkpoint_table)
+            )
+            print(f"Chunk {c + 1}/{n_chunks} written.")
+        print("LLM extraction completed.")
+
+    return spark.table(cfg.checkpoint_table) if spark.catalog.tableExists(cfg.checkpoint_table) else None
+
+
+# ==========================================================
+# USAGE  (Databricks notebook cell)
+# ==========================================================
+#
+# cfg = ExtractionConfig(
+#     model=DEPLOYMENT_NAME,
+#     base_url="https://<workspace-host>/serving-endpoints",
+#     #   or: f"https://{spark.conf.get('spark.databricks.workspaceUrl')}/serving-endpoints"
+#     api_key=DATABRICKS_TOKEN,          # prefer dbutils.secrets.get(scope, key)
+#     checkpoint_table="<catalog>.<schema>.kg_relationship_checkpoint_ctx",
+#     link_filter="is_resolved",
+#     ignore_link_types=("doc:wiki",),
+#     window_words=6,
+#     max_workers=8,                     # tune to endpoint rate limit
+# )
+#
+# triples_df = run_relationship_extraction(
+#     spark,
+#     links_df=sentences_df,
+#     docs_df=document_rendered_df,
+#     cfg=cfg,
+#     columns=ColumnMap(doc_text="content_with_titles"),
+# )
+#
+# if triples_df is not None:
+#     display(
+#         triples_df.select(
+#             "source_title", "predicate", "target_title",
+#             "relationship_strength", "relationship_description",
+#             "context_used", "link_type",
+#         ).orderBy("source_title", "target_title")
+#     )
+# else:
+#     print("No relationships found.")
