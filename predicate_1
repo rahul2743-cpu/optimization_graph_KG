@@ -1,2490 +1,319 @@
 # ==========================================================
-# CELL 10
-# ITERATIVE LLM RELATIONSHIP / PREDICATE EXTRACTION
+# Cell 10b : LLM RELATIONSHIP EXTRACTION -- RUN  (part 2 of 2)
 #
-# MAIN LOGIC:
+#   Requires Cell 10a to have been run in this session.
+#   Needs: sentences_df (Cell 8b)
 #
-#   SOURCE DOCUMENT TITLE
-#          +
-#   ONE TARGET HYPERLINK
-#          +
-#   SENTENCE CONTAINING TARGET
-#          +
-#   6-WORD LOCAL CONTEXT
-#          |
-#          v
-#       ONE LLM CALL
-#          |
-#          v
-#     ONE PREDICATE
-#          |
-#          v
-#     ONE RDF TRIPLE
+#   What this cell does:
+#     1  one work item per (document, target): the FIRST occurrence's
+#        sentence + how many times the target is linked
+#     2  retry failed targets, skip finished ones (resume)
+#     3  run the LLM extraction in chunks, saving after each chunk
+#     4  expose `triples_df` (usable rows only) for Cell 11
 #
-# IMPORTANT:
+#   This is the cell that makes LLM calls. Re-running it resumes
+#   where the last run stopped.
 #
-# One document can contain many targets.
-#
-# Example:
-#
-#   Document A
-#       |
-#       +---- <Temperature>
-#       |         |
-#       |       LLM CALL 1
-#       |         |
-#       |       Predicate 1
-#       |
-#       +---- <MTCCM>
-#       |         |
-#       |       LLM CALL 2
-#       |         |
-#       |       Predicate 2
-#       |
-#       +---- <TCCM>
-#                 |
-#               LLM CALL 3
-#                 |
-#               Predicate 3
-#
-# NOT:
-#
-#   One document -> one LLM call for all targets
-#
+#   OUTPUT FOR THE REST OF THE NOTEBOOK:
+#     triples_df      status == 'ok' rows only  -> Cell 11 / 12 (graph)
+#     triples_all_df  every row incl. failed / parse_error (diagnostics)
+#   Failed rows never enter the graph as fake "related_to" edges.
 # ==========================================================
-
-
-import re
-import time
-
-
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
-from pyspark.sql.types import (
-    StructType,
-    StructField,
-    StringType,
-    IntegerType
-)
+_required = [
+    "process_partition_pandas", "TRIPLES_SCHEMA", "CHECKPOINT_TABLE",
+    "N_PARTITIONS", "CHUNK_TARGETS", "RETRY_FAILED", "TARGET_PLACEHOLDER",
+]
 
+_missing = [n for n in _required if n not in globals()]
 
-# ==========================================================
-# 1. CELL START
-# ==========================================================
+if _missing:
+    raise RuntimeError(f"Run Cell 10a first. Missing definitions: {_missing}")
+
+if "sentences_df" not in globals():
+    raise RuntimeError("sentences_df not found. Run Cell 8b first.")
 
 print("=" * 80)
-print("CELL 10 — ITERATIVE LLM RELATIONSHIP EXTRACTION")
-print("1 Target -> 1 Sentence -> 1 LLM Call -> 1 Predicate")
-print("=" * 80)
-
-
-# ==========================================================
-# 2. CONFIGURATION
-# ==========================================================
-
-# ----------------------------------------------------------
-# NEW CHECKPOINT
-#
-# Old:
-# kg_relationship_checkpoint
-#
-# New:
-# kg_relationship_checkpoint_cell10_v2
-#
-# This allows the new Cell 10 logic to run independently
-# from the previous 1432 relationships.
-# ----------------------------------------------------------
-
-CHECKPOINT_TABLE = (
-    "knwbt_airr_foundry_dev_catalog.secured."
-    "kg_relationship_checkpoint_cell10_v2"
-)
-
-
-# ----------------------------------------------------------
-# Spark partitions
-# ----------------------------------------------------------
-
-N_PARTITIONS = 16
-
-
-# ----------------------------------------------------------
-# Parallel LLM calls inside each Spark partition
-# ----------------------------------------------------------
-
-LLM_THREADS_PER_PARTITION = 8
-
-
-# ----------------------------------------------------------
-# LLM configuration
-# ----------------------------------------------------------
-
-LLM_MAX_RETRIES = 6
-
-LLM_TIMEOUT_SECONDS = 60
-
-LLM_MAX_TOKENS = 200
-
-
-# ----------------------------------------------------------
-# Checkpoint chunk size
-# ----------------------------------------------------------
-
-CHUNK_DOCS = 500
-
-
-# ----------------------------------------------------------
-# Retry documents containing failed rows
-# ----------------------------------------------------------
-
-RETRY_FAILED = True
-
-
-# ----------------------------------------------------------
-# Sentence configuration
-# ----------------------------------------------------------
-
-MAX_SENTENCE_CHARS = 4000
-
-MAX_EVIDENCE_CHARS = 1500
-
-LOCAL_CONTEXT_WORDS = 6
-
-
-# ==========================================================
-# 3. CONNECTION CONFIGURATION
-# ==========================================================
-
-# Your Cell 16 already creates:
-#
-#   DATABRICKS_TOKEN
-#   DEPLOYMENT_NAME
-#
-# We use those existing variables.
-
-_CONN = {
-
-    "model":
-        DEPLOYMENT_NAME,
-
-    "base_url":
-        (
-            "https://adb-3955688708870984.4."
-            "azuredatabricks.net/serving-endpoints"
-        ),
-
-    "api_key":
-        DATABRICKS_TOKEN,
-}
-
-
-# ==========================================================
-# 4. OUTPUT DELIMITERS
-# ==========================================================
-
-TUPLE_DELIM = "<|>"
-
-RECORD_DELIM = "##"
-
-
-# ==========================================================
-# 5. SYSTEM PROMPT
-# ==========================================================
-
-SYSTEM_PROMPT = f"""
---- ROLE ---
-
-You are an AI assistant extracting ONE semantic relationship
-for a knowledge graph.
-
-
---- TASK ---
-
-You are given:
-
-1. SOURCE document title.
-2. ONE TARGET entity.
-3. The full sentence containing the target hyperlink.
-4. A focused local context containing approximately
-   6 words before and 6 words after the hyperlink.
-
-Determine the ONE semantic relationship between the SOURCE
-document and this ONE TARGET entity.
-
-
---- IMPORTANT ---
-
-There is ONLY ONE target entity in this request.
-
-Do NOT identify additional entities.
-
-Do NOT create additional nodes.
-
-Do NOT invent entities.
-
-Do NOT create multiple predicates.
-
-Return exactly ONE predicate.
-
-
---- SOURCE ---
-
-The SOURCE is the document title.
-
-The document title is already known.
-
-Do not replace the source with another word from the sentence.
-
-Words such as:
-
-Artifact
-SME team
-Analysis
-Process
-System
-
-are context only.
-
-
---- TARGET ---
-
-The TARGET is the entity explicitly provided.
-
-Do not replace it with another entity.
-
-
---- DIRECTION ---
-
-The relationship must be:
-
-SOURCE -> predicate -> TARGET
-
-The SOURCE is always the subject.
-
-The TARGET is always the object.
-
-Do not reverse the relationship.
-
-
---- CONTEXT ---
-
-The FULL SENTENCE is the PRIMARY context.
-
-The 6-word LOCAL CONTEXT is additional focused context.
-
-Use the full sentence when necessary.
-
-
---- PREDICATE RULES ---
-
-Generate exactly ONE semantic predicate.
-
-The predicate must:
-
-- be lowercase
-- use snake_case
-- contain 1 to 5 words
-- contain no spaces
-- contain no hyphens
-- represent the actual relationship
-- be grounded only in the supplied sentence/context
-
-
-Examples:
-
-uses
-depends_on
-runs_in
-contains
-belongs_to
-supports
-controlled_by
-owned_and_maintained_by
-is_subject_to
-opens
-describes
-mentions
-related_to
-
-
-If the target is only referenced/listed without a meaningful
-relationship:
-
-mentions
-
-
-If the relationship is genuinely unclear:
-
-related_to
-
-
---- STRENGTH ---
-
-Return an integer from 1 to 10.
-
-10 = very explicit relationship
-8-9 = strong explicit relationship
-5-7 = meaningful but less direct
-3-4 = weak relationship
-1-2 = very weak/incidental relationship
-
-
---- OUTPUT FORMAT ---
-
-Return EXACTLY:
-
-<Entity Name>{TUPLE_DELIM}<predicate>{TUPLE_DELIM}<description>{TUPLE_DELIM}<strength>{RECORD_DELIM}
-
-No JSON.
-No markdown.
-No explanation outside the record.
-
-Do not use {TUPLE_DELIM} or {RECORD_DELIM} inside description.
-
-
---- EXAMPLE ---
-
-SOURCE:
-MTCCM Help: MTCCM.Run OpenTCCM
-
-TARGET:
-MTCCM
-
-FULL SENTENCE:
-Any changes made will be lost if <MTCCM> is uninstalled.
-
-LOCAL CONTEXT:
-changes made will be lost if <MTCCM> is uninstalled.
-
-OUTPUT:
-
-MTCCM{TUPLE_DELIM}describes_uninstall_of{TUPLE_DELIM}The sentence warns that changes are lost when MTCCM is uninstalled.{TUPLE_DELIM}6{RECORD_DELIM}
-"""
-
-
-# ==========================================================
-# 6. UNRESOLVED MARKUP
-# ==========================================================
-
-# Raw unresolved references such as:
-#
-# <doc:wiki:Temp_Import....>
-#
-# are NOT targets.
-
-_UNRESOLVED_MARKUP_RE = re.compile(
-    r"\[?<doc:(?:wiki:)?[^<>]+>\]?"
-)
-
-
-# ==========================================================
-# 7. MARKUP / SENTENCE HELPERS
-# ==========================================================
-
-_MARKUP_SPAN_RE = re.compile(
-    r"<[^<>]*>"
-)
-
-
-_BOUNDARY_RE = re.compile(
-    r"[.!?][\"')\]]*(?=\s|$)|\n"
-)
-
-
-_ABBREVIATIONS = {
-    "e.g",
-    "i.e",
-    "etc",
-    "vs",
-    "inc",
-    "ltd",
-    "co",
-    "corp",
-    "fig",
-    "no",
-    "dr",
-    "mr",
-    "mrs",
-    "ms",
-    "prof",
-    "approx",
-    "eq",
-    "cf",
-    "al",
-    "sec",
-    "vol",
-    "ver",
-    "rev",
-}
-
-
-# ==========================================================
-# 8. PREDICATE NORMALIZATION
-# ==========================================================
-
-PREDICATE_ALIASES = {
-
-    "is_related_to":
-        "related_to",
-
-    "relates_to":
-        "related_to",
-
-    "utilizes":
-        "uses",
-
-    "utilises":
-        "uses",
-
-    "relies_on":
-        "depends_on",
-
-    "is_dependent_on":
-        "depends_on",
-
-    "refers_to":
-        "mentions",
-
-    "references":
-        "mentions",
-
-    "is_part_of":
-        "belongs_to",
-
-    "includes":
-        "contains",
-}
-
-
-def _to_snake_case(s):
-
-    s = (
-        s or ""
-    ).strip().lower()
-
-    s = re.sub(
-        r"[^a-z0-9]+",
-        "_",
-        s
-    )
-
-    s = re.sub(
-        r"_+",
-        "_",
-        s
-    )
-
-    s = s.strip("_")
-
-    return (
-        s
-        or
-        "related_to"
-    )
-
-
-def _normalize_predicate(s):
-
-    predicate = _to_snake_case(s)
-
-    predicate = PREDICATE_ALIASES.get(
-        predicate,
-        predicate
-    )
-
-    words = predicate.split("_")
-
-    if len(words) > 5:
-
-        predicate = "_".join(
-            words[:5]
-        )
-
-    return (
-        predicate
-        or
-        "related_to"
-    )
-
-
-# ==========================================================
-# 9. LLM RESPONSE TEXT
-# ==========================================================
-
-def _response_text(resp):
-
-    content = getattr(
-        resp,
-        "content",
-        resp
-    )
-
-    if isinstance(
-        content,
-        list
-    ):
-
-        parts = []
-
-        for block in content:
-
-            if isinstance(
-                block,
-                dict
-            ):
-
-                if block.get(
-                    "type"
-                ) in (
-                    None,
-                    "text"
-                ):
-
-                    parts.append(
-                        block.get(
-                            "text",
-                            ""
-                        )
-                        or
-                        ""
-                    )
-
-            else:
-
-                parts.append(
-                    str(block)
-                )
-
-        return "".join(
-            parts
-        ).strip()
-
-    return str(
-        content
-        or
-        ""
-    ).strip()
-
-
-# ==========================================================
-# 10. CLEAN DOCUMENT
-# ==========================================================
-
-def _sanitize_for_llm(text):
-
-    text = (
-        text
-        or
-        ""
-    )
-
-    # Remove unresolved wiki/document markup.
-    text = _UNRESOLVED_MARKUP_RE.sub(
-        " ",
-        text
-    )
-
-    # Normalize whitespace.
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
-
-    return text.strip()
-
-
-# ==========================================================
-# 11. TARGET REGEX
-# ==========================================================
-
-def _target_pattern(entity_name):
-
-    words = (
-        entity_name
-        or
-        ""
-    ).split()
-
-    if not words:
-
-        return None
-
-    return re.compile(
-        r"<\s*"
-        +
-        r"\s+".join(
-            re.escape(w)
-            for w in words
-        )
-        +
-        r"\s*>",
-        flags=re.IGNORECASE
-    )
-
-
-# ==========================================================
-# 12. PREPARE DOCUMENT
-# ==========================================================
-
-def _prepare_document(content):
-
-    text = _UNRESOLVED_MARKUP_RE.sub(
-        " ",
-        content
-        or
-        ""
-    )
-
-    # Mask hyperlinks so that periods inside:
-    #
-    # <MTCCM.Run>
-    #
-    # do not become sentence boundaries.
-
-    masked = _MARKUP_SPAN_RE.sub(
-        lambda m:
-            "x" * len(
-                m.group(0)
-            ),
-        text
-    )
-
-    return (
-        text,
-        masked
-    )
-
-
-# ==========================================================
-# 13. SENTENCE BOUNDARY
-# ==========================================================
-
-def _is_sentence_boundary(
-    masked,
-    match
-):
-
-    token = match.group(0)
-
-    if (
-        token == "\n"
-        or
-        token[0] != "."
-    ):
-
-        return True
-
-    before = masked[
-        max(
-            0,
-            match.start() - 30
-        ):
-        match.start()
-    ]
-
-    last = re.search(
-        r"(\S+)$",
-        before
-    )
-
-    if not last:
-
-        return True
-
-    word = (
-        last.group(1)
-        .lower()
-        .lstrip(
-            "(['\""
-        )
-    )
-
-    if word in _ABBREVIATIONS:
-
-        return False
-
-    if (
-        len(word) == 1
-        and
-        word.isalpha()
-    ):
-
-        return False
-
-    return True
-
-
-# ==========================================================
-# 14. FIND SENTENCE FOR ONE TARGET
-# ==========================================================
-
-def _find_sentence_for_entity(
-    doc,
-    entity_name
-):
-
-    text, masked = doc
-
-    pattern = _target_pattern(
-        entity_name
-    )
-
-    if (
-        pattern is None
-        or
-        not text
-    ):
-
-        return ""
-
-    target_match = pattern.search(
-        text
-    )
-
-    if not target_match:
-
-        return ""
-
-    # ------------------------------------------------------
-    # Search left
-    # ------------------------------------------------------
-
-    lo = max(
-        0,
-        target_match.start()
-        -
-        MAX_SENTENCE_CHARS
-    )
-
-    start = lo
-
-    for boundary in _BOUNDARY_RE.finditer(
-        masked,
-        lo,
-        target_match.start()
-    ):
-
-        if _is_sentence_boundary(
-            masked,
-            boundary
-        ):
-
-            start = boundary.end()
-
-
-    # ------------------------------------------------------
-    # Search right
-    # ------------------------------------------------------
-
-    hi = min(
-        len(text),
-        target_match.end()
-        +
-        MAX_SENTENCE_CHARS
-    )
-
-    end = hi
-
-    for boundary in _BOUNDARY_RE.finditer(
-        masked,
-        target_match.end(),
-        hi
-    ):
-
-        if _is_sentence_boundary(
-            masked,
-            boundary
-        ):
-
-            end = boundary.end()
-
-            break
-
-
-    sentence = text[
-        start:end
-    ]
-
-    return _sanitize_for_llm(
-        sentence
-    )
-
-
-# ==========================================================
-# 15. EXTRACT 6-WORD LOCAL CONTEXT
-# ==========================================================
-
-def _extract_local_context(
-    sentence,
-    entity_name,
-    window=6
-):
-
-    pattern = _target_pattern(
-        entity_name
-    )
-
-    if (
-        not sentence
-        or
-        pattern is None
-    ):
-
-        return ""
-
-    match = pattern.search(
-        sentence
-    )
-
-    if not match:
-
-        return ""
-
-    before_words = (
-        sentence[
-            :match.start()
-        ]
-        .split()
-        [-window:]
-    )
-
-    after_words = (
-        sentence[
-            match.end():
-        ]
-        .split()
-        [:window]
-    )
-
-    return " ".join(
-        before_words
-        +
-        [match.group(0)]
-        +
-        after_words
-    )
-
-
-# ==========================================================
-# 16. KEEP TARGET INSIDE SENTENCE WINDOW
-# ==========================================================
-
-def _window_around_target(
-    sentence,
-    entity_name,
-    max_chars
-):
-
-    if len(sentence) <= max_chars:
-
-        return sentence
-
-    pattern = _target_pattern(
-        entity_name
-    )
-
-    match = (
-        pattern.search(sentence)
-        if pattern
-        else
-        None
-    )
-
-    center = (
-        match.start()
-        if match
-        else
-        0
-    )
-
-    start = max(
-        0,
-        center - max_chars // 2
-    )
-
-    end = min(
-        len(sentence),
-        start + max_chars
-    )
-
-    start = max(
-        0,
-        end - max_chars
-    )
-
-    prefix = (
-        "...[truncated] "
-        if start > 0
-        else
-        ""
-    )
-
-    suffix = (
-        " ...[truncated]"
-        if end < len(sentence)
-        else
-        ""
-    )
-
-    return (
-        prefix
-        +
-        sentence[start:end]
-        +
-        suffix
-    )
-
-
-# ==========================================================
-# 17. BUILD CONTEXT FOR ONE TARGET
-# ==========================================================
-
-def _build_entity_context(
-    doc,
-    entity_name
-):
-
-    sentence = _find_sentence_for_entity(
-        doc,
-        entity_name
-    )
-
-    local_context = _extract_local_context(
-        sentence,
-        entity_name,
-        LOCAL_CONTEXT_WORDS
-    )
-
-    sentence = _window_around_target(
-        sentence,
-        entity_name,
-        MAX_SENTENCE_CHARS
-    )
-
-    return (
-        sentence,
-        local_context
-    )
-
-
-# ==========================================================
-# 18. PARSE ONE LLM RESPONSE
-# ==========================================================
-
-def _parse_single_record(text):
-
-    if not text:
-
-        return (
-            "related_to",
-            "[empty LLM response]",
-            1,
-            False
-        )
-
-    record = (
-        text
-        .split(
-            RECORD_DELIM
-        )[0]
-        .strip()
-        .strip(",")
-    )
-
-    parts = [
-        p.strip()
-        for p in record.split(
-            TUPLE_DELIM
-        )
-    ]
-
-    if len(parts) < 3:
-
-        return (
-            "related_to",
-            (
-                "[unparseable LLM response: "
-                f"{text[:200]}]"
-            ),
-            1,
-            False
-        )
-
-    predicate = _normalize_predicate(
-        parts[1]
-    )
-
-    strength = 5
-
-    description_parts = parts[2:]
-
-    if len(parts) >= 4:
-
-        match = re.search(
-            r"\d+",
-            parts[-1]
-        )
-
-        if match:
-
-            strength = max(
-                1,
-                min(
-                    10,
-                    int(
-                        match.group()
-                    )
-                )
-            )
-
-            description_parts = (
-                parts[2:-1]
-            )
-
-    description = " ".join(
-        p
-        for p in description_parts
-        if p
-    )
-
-    return (
-        predicate,
-        description,
-        strength,
-        True
-    )
-
-
-# ==========================================================
-# 19. ONE TARGET -> ONE LLM CALL
-# ==========================================================
-
-def _extract_one(
-    llm,
-    source_title,
-    doc,
-    target_title
-):
-
-    sentence = ""
-
-    try:
-
-        # --------------------------------------------------
-        # Find ONE target's sentence
-        # --------------------------------------------------
-
-        sentence, local_context = (
-            _build_entity_context(
-                doc,
-                target_title
-            )
-        )
-
-
-        # --------------------------------------------------
-        # No sentence found
-        # --------------------------------------------------
-
-        if not sentence:
-
-            return {
-
-                "predicate":
-                    "related_to",
-
-                "description":
-                    (
-                        "[No sentence containing "
-                        "target hyperlink was found]"
-                    ),
-
-                "strength":
-                    1,
-
-                "status":
-                    "no_sentence",
-
-                "sentence":
-                    "",
-            }
-
-
-        # --------------------------------------------------
-        # ONE TARGET PROMPT
-        # --------------------------------------------------
-
-        user_prompt = f"""
-SOURCE DOCUMENT TITLE:
-{source_title}
-
-
-TARGET ENTITY:
-{target_title}
-
-
-FULL SENTENCE CONTAINING THE TARGET:
-{sentence}
-
-
-FOCUSED LOCAL CONTEXT:
-{local_context}
-
-
-TASK:
-
-Determine the ONE semantic relationship between:
-
-SOURCE:
-{source_title}
-
-TARGET:
-{target_title}
-
-The SOURCE is the subject.
-
-The TARGET is the object.
-
-Use the full sentence as the primary context.
-
-Use the local context as additional focused context.
-
-Return exactly ONE predicate.
-"""
-
-
-        # --------------------------------------------------
-        # ONE LLM CALL
-        # --------------------------------------------------
-
-        response = llm.invoke(
-            [
-                {
-                    "role":
-                        "system",
-
-                    "content":
-                        SYSTEM_PROMPT,
-                },
-
-                {
-                    "role":
-                        "user",
-
-                    "content":
-                        user_prompt,
-                },
-            ]
-        )
-
-
-        # --------------------------------------------------
-        # Parse response
-        # --------------------------------------------------
-
-        (
-            predicate,
-            description,
-            strength,
-            parsed_ok
-        ) = _parse_single_record(
-            _response_text(
-                response
-            )
-        )
-
-
-        return {
-
-            "predicate":
-                predicate,
-
-            "description":
-                description,
-
-            "strength":
-                strength,
-
-            "status":
-                (
-                    "ok"
-                    if parsed_ok
-                    else
-                    "parse_error"
-                ),
-
-            "sentence":
-                sentence,
-        }
-
-
-    except Exception as e:
-
-        return {
-
-            "predicate":
-                "related_to",
-
-            "description":
-                (
-                    "[extraction failed: "
-                    f"{type(e).__name__}: "
-                    f"{str(e)[:300]}]"
-                ),
-
-            "strength":
-                1,
-
-            "status":
-                "failed",
-
-            "sentence":
-                sentence,
-        }
-
-
-# ==========================================================
-# 20. DISTRIBUTED WORKER
-# ==========================================================
-
-def process_partition_pandas(
-    pdf_iterator
-):
-
-    import pandas as pd
-
-    from concurrent.futures import (
-        ThreadPoolExecutor
-    )
-
-    from langchain_openai import ChatOpenAI
-
-
-    # ------------------------------------------------------
-    # LLM client for this Spark partition
-    # ------------------------------------------------------
-
-    partition_llm = ChatOpenAI(
-
-        model=
-            _CONN["model"],
-
-        base_url=
-            _CONN["base_url"],
-
-        api_key=
-            _CONN["api_key"],
-
-        temperature=
-            0,
-
-        max_retries=
-            LLM_MAX_RETRIES,
-
-        timeout=
-            LLM_TIMEOUT_SECONDS,
-
-        max_tokens=
-            LLM_MAX_TOKENS,
-    )
-
-
-    # ------------------------------------------------------
-    # Output columns
-    # ------------------------------------------------------
-
-    out_columns = [
-
-        "source_node",
-
-        "source_title",
-
-        "predicate",
-
-        "relationship_description",
-
-        "relationship_strength",
-
-        "target_title",
-
-        "target_reference",
-
-        "link_type",
-
-        "status",
-
-        "evidence_sentence",
-    ]
-
-
-    # ======================================================
-    # PROCESS EACH ARROW BATCH
-    # ======================================================
-
-    for pdf in pdf_iterator:
-
-        work = {}
-
-        row_plan = []
-
-
-        # ==================================================
-        # DOCUMENT LOOP
-        # ==================================================
-
-        for _, row in pdf.iterrows():
-
-            # Prepare document only once.
-
-            doc = _prepare_document(
-                row[
-                    "content_with_titles"
-                ]
-            )
-
-
-            # ==================================================
-            # TARGET LOOP
-            # ==================================================
-
-            for entity in row[
-                "entities"
-            ]:
-
-                target_title = (
-                    entity[
-                        "target_title"
-                    ]
-                )
-
-
-                # One unique unit:
-                #
-                # source document + target title
-                #
-                # Same target appearing multiple times in one
-                # document gets only ONE LLM call.
-
-                key = (
-                    row[
-                        "source_node"
-                    ],
-                    target_title
-                )
-
-
-                if key not in work:
-
-                    work[key] = (
-
-                        row[
-                            "source_title"
-                        ],
-
-                        doc,
-
-                        target_title,
-                    )
-
-
-                row_plan.append(
-                    (
-                        row,
-                        entity,
-                        key
-                    )
-                )
-
-
-        # ==================================================
-        # RUN ONE LLM CALL PER TARGET
-        #
-        # Calls are parallel for speed, but each request
-        # contains ONLY ONE target.
-        # ==================================================
-
-        def _run(key):
-
-            (
-                source_title,
-                doc,
-                target_title
-            ) = work[key]
-
-            return (
-                key,
-                _extract_one(
-                    partition_llm,
-                    source_title,
-                    doc,
-                    target_title
-                )
-            )
-
-
-        with ThreadPoolExecutor(
-            max_workers=
-                LLM_THREADS_PER_PARTITION
-        ) as pool:
-
-            results = dict(
-                pool.map(
-                    _run,
-                    list(
-                        work.keys()
-                    )
-                )
-            )
-
-
-        # ==================================================
-        # BUILD OUTPUT
-        # ==================================================
-
-        out_rows = []
-
-
-        for (
-            row,
-            entity,
-            key
-        ) in row_plan:
-
-            result = results[key]
-
-
-            out_rows.append(
-                {
-
-                    # SOURCE = DOCUMENT TITLE
-                    "source_node":
-                        row[
-                            "source_title"
-                        ],
-
-                    "source_title":
-                        row[
-                            "source_title"
-                        ],
-
-                    "predicate":
-                        result[
-                            "predicate"
-                        ],
-
-                    "relationship_description":
-                        result[
-                            "description"
-                        ],
-
-                    "relationship_strength":
-                        result[
-                            "strength"
-                        ],
-
-                    # TARGET = RESOLVED TARGET
-                    "target_title":
-                        entity[
-                            "target_title"
-                        ],
-
-                    "target_reference":
-                        entity[
-                            "target_reference"
-                        ],
-
-                    "link_type":
-                        entity[
-                            "link_type"
-                        ],
-
-                    "status":
-                        result[
-                            "status"
-                        ],
-
-                    "evidence_sentence":
-                        result[
-                            "sentence"
-                        ][
-                            :MAX_EVIDENCE_CHARS
-                        ],
-                }
-            )
-
-
-        # --------------------------------------------------
-        # Always yield matching schema
-        # --------------------------------------------------
-
-        yield pd.DataFrame(
-            out_rows,
-            columns=out_columns
-        )
-
-
-# ==========================================================
-# 21. OUTPUT SCHEMA
-# ==========================================================
-
-TRIPLES_SCHEMA = StructType([
-
-    StructField(
-        "source_node",
-        StringType()
-    ),
-
-    StructField(
-        "source_title",
-        StringType()
-    ),
-
-    StructField(
-        "predicate",
-        StringType()
-    ),
-
-    StructField(
-        "relationship_description",
-        StringType()
-    ),
-
-    StructField(
-        "relationship_strength",
-        IntegerType()
-    ),
-
-    StructField(
-        "target_title",
-        StringType()
-    ),
-
-    StructField(
-        "target_reference",
-        StringType()
-    ),
-
-    StructField(
-        "link_type",
-        StringType()
-    ),
-
-    StructField(
-        "status",
-        StringType()
-    ),
-
-    StructField(
-        "evidence_sentence",
-        StringType()
-    ),
-])
-
-
-# ==========================================================
-# 22. RESOLVE UPSTREAM DATAFRAMES
-#
-# THIS FIXES:
-#
-# NameError: name 'sentences_df' is not defined
-#
-# We first use the expected names.
-#
-# If those names are not defined, we look for another
-# Spark DataFrame already created in the notebook that has
-# the required columns.
-# ==========================================================
-
-def _find_existing_dataframe(
-    preferred_name,
-    required_columns
-):
-
-    # ------------------------------------------------------
-    # First: exact expected variable name
-    # ------------------------------------------------------
-
-    candidate = globals().get(
-        preferred_name
-    )
-
-    if candidate is not None:
-
-        try:
-
-            columns = set(
-                candidate.columns
-            )
-
-            if set(
-                required_columns
-            ).issubset(columns):
-
-                return candidate
-
-        except Exception:
-
-            pass
-
-
-    # ------------------------------------------------------
-    # Second: search existing notebook variables
-    # ------------------------------------------------------
-
-    for name, obj in list(
-        globals().items()
-    ):
-
-        if name.startswith("_"):
-
-            continue
-
-        try:
-
-            if not hasattr(
-                obj,
-                "columns"
-            ):
-
-                continue
-
-            columns = set(
-                obj.columns
-            )
-
-            if set(
-                required_columns
-            ).issubset(columns):
-
-                print(
-                    f"Using existing DataFrame "
-                    f"'{name}' for '{preferred_name}'."
-                )
-
-                return obj
-
-        except Exception:
-
-            continue
-
-
-    # ------------------------------------------------------
-    # Nothing found
-    # ------------------------------------------------------
-
-    return None
-
-
-# ==========================================================
-# 23. FIND SENTENCES DATAFRAME
-# ==========================================================
-
-print()
-print("=" * 80)
-print("RESOLVING UPSTREAM DATAFRAMES")
+print("CELL 10b — RUN LLM RELATIONSHIP EXTRACTION")
 print("=" * 80)
 
 
-sentences_df_resolved = (
-    _find_existing_dataframe(
-        "sentences_df",
-
-        [
-            "source_node",
-            "source_title",
-            "target_reference",
-            "target_title",
-            "link_type",
-            "is_resolved",
-        ]
-    )
-)
-
-
-if sentences_df_resolved is None:
-
-    raise NameError(
-        """
-Cell 10 could not find the resolved-target DataFrame.
-
-Expected a DataFrame containing:
-
-source_node
-source_title
-target_reference
-target_title
-link_type
-is_resolved
-
-The expected variable name is:
-
-sentences_df
-
-Please make sure the earlier cell that creates the
-resolved hyperlink DataFrame has been executed.
-
-The LLM configuration itself is working; this is only
-an upstream DataFrame dependency.
-"""
-    )
-
-
-# Use the resolved DataFrame from now on.
-
-sentences_df = sentences_df_resolved
-
-
-print(
-    "Resolved target DataFrame:"
-)
-
-print(
-    sentences_df.columns
-)
-
-
 # ==========================================================
-# 24. FIND DOCUMENT CONTENT DATAFRAME
+# 1. ONE WORK ITEM PER (DOCUMENT, TARGET)
+#
+# sentences_df has one row per link OCCURRENCE. A target linked
+# several times in a document is extracted ONCE, from its first
+# occurrence, and the link count is passed to the LLM.
 # ==========================================================
 
-document_rendered_df_resolved = (
-    _find_existing_dataframe(
-        "document_rendered_df",
+KEY_COLS = ["source_node", "target_reference"]
 
-        [
-            "source_node",
-            "content_with_titles",
-        ]
+resolved_occurrences = sentences_df.filter(F.col("is_resolved"))
+
+w_key = Window.partitionBy(*KEY_COLS)
+
+targets_all = (
+    resolved_occurrences
+    .filter(F.col("sentence_masked").contains(TARGET_PLACEHOLDER))
+    .withColumn("mention_count", F.count(F.lit(1)).over(w_key).cast("int"))
+    .withColumn(
+        "_rk",
+        F.row_number().over(w_key.orderBy(F.col("occurrence").asc()))
     )
-)
-
-
-if document_rendered_df_resolved is None:
-
-    raise NameError(
-        """
-Cell 10 could not find the document-content DataFrame.
-
-Expected a DataFrame containing:
-
-source_node
-content_with_titles
-
-The expected variable name is:
-
-document_rendered_df
-
-Please make sure the earlier cell that creates the
-rendered document DataFrame has been executed.
-"""
-    )
-
-
-document_rendered_df = (
-    document_rendered_df_resolved
-)
-
-
-print(
-    "Resolved document content DataFrame:"
-)
-
-print(
-    document_rendered_df.columns
-)
-
-
-# ==========================================================
-# 25. GET RESOLVED TARGETS
-# ==========================================================
-
-print()
-print("=" * 80)
-print("GETTING RESOLVED TARGETS")
-print("=" * 80)
-
-
-distinct_targets = (
-
-    sentences_df
-
-    # ------------------------------------------------------
-    # ONLY RESOLVED TARGETS
-    # ------------------------------------------------------
-
-    .filter(
-        F.col(
-            "is_resolved"
-        ) == True
-    )
-
-    .filter(
-        F.col(
-            "target_title"
-        ).isNotNull()
-    )
-
-    .filter(
-        F.trim(
-            F.col(
-                "target_title"
-            )
-        ) != ""
-    )
-
+    .filter(F.col("_rk") == 1)
     .select(
         "source_node",
         "source_title",
         "target_reference",
         "target_title",
-        "link_type"
-    )
-
-    # ------------------------------------------------------
-    # Same source + target = one LLM call
-    # ------------------------------------------------------
-
-    .dropDuplicates(
-        [
-            "source_node",
-            "target_title"
-        ]
+        "link_type",
+        "sentence_masked",
+        "mention_count",
     )
 )
 
+n_occurrences = resolved_occurrences.count()
+n_pairs_resolved = resolved_occurrences.select(*KEY_COLS).distinct().count()
+n_targets_total = targets_all.count()
 
-n_targets = (
-    distinct_targets.count()
-)
+print(f"Resolved link occurrences (Cell 8b)        : {n_occurrences}")
+print(f"Distinct (document, target) pairs          : {n_pairs_resolved}")
+print(f"Targets with a locatable sentence          : {n_targets_total}")
 
-
-print(
-    f"Unique document-target pairs : "
-    f"{n_targets}"
-)
-
-
-# ==========================================================
-# 26. GROUP TARGETS BY DOCUMENT
-# ==========================================================
-#
-# IMPORTANT:
-#
-# Grouping DOES NOT mean one LLM call.
-#
-# It only creates:
-#
-# Document
-#    |
-#    +-- Target 1
-#    +-- Target 2
-#    +-- Target 3
-#
-# The worker later performs one LLM call for each target.
-#
-# ==========================================================
-
-doc_entities = (
-
-    distinct_targets
-
-    .groupBy(
-        "source_node",
-        "source_title"
+if n_targets_total < n_pairs_resolved:
+    print(
+        f"WARNING: {n_pairs_resolved - n_targets_total} targets have no "
+        f"placeholder in sentence_masked and are skipped (check Cell 8b)."
     )
 
-    .agg(
-        F.collect_list(
-            F.struct(
-                "target_title",
-                "target_reference",
-                "link_type"
-            )
-        ).alias(
-            "entities"
-        )
-    )
-)
-
 
 # ==========================================================
-# 27. JOIN FULL DOCUMENT CONTENT
+# 2. CHECKPOINT: RETRY FAILED TARGETS, SKIP FINISHED ONES
+#
+# The checkpoint key is (source_node, target_reference), so a
+# crash or a failure only ever costs the affected targets.
 # ==========================================================
 
-doc_prompt_inputs = (
+targets = targets_all
 
-    doc_entities
-
-    .join(
-        document_rendered_df.select(
-            "source_node",
-            "content_with_titles"
-        ),
-
-        on="source_node",
-
-        how="inner"
-    )
-)
-
-
-# ==========================================================
-# 28. CHECKPOINT
-# ==========================================================
-
-print()
-print("=" * 80)
-print("CHECKPOINT CHECK")
-print("=" * 80)
-
-
-table_exists = (
-    spark.catalog.tableExists(
-        CHECKPOINT_TABLE
-    )
-)
-
+table_exists = spark.catalog.tableExists(CHECKPOINT_TABLE)
 
 if table_exists:
 
-    existing_checkpoint = (
-        spark.table(
-            CHECKPOINT_TABLE
-        )
-    )
+    existing_cols = spark.table(CHECKPOINT_TABLE).columns
 
-
-    existing_columns = (
-        existing_checkpoint.columns
-    )
-
-
-    # ------------------------------------------------------
-    # Identify failed documents.
-    # ------------------------------------------------------
-
-    failed_conditions = [
-
-        (
-            "relationship_description "
-            "LIKE '[extraction failed%'"
-        )
-
+    failed_sql_parts = [
+        "relationship_description LIKE '[extraction failed%'"
     ]
 
+    if "status" in existing_cols:
+        failed_sql_parts.append("status = 'failed'")
 
-    if "status" in existing_columns:
+    failed_sql = " OR ".join(failed_sql_parts)
 
-        failed_conditions.append(
-            "status = 'failed'"
-        )
+    n_failed_rows = spark.sql(
+        f"SELECT COUNT(*) AS n FROM {CHECKPOINT_TABLE} WHERE {failed_sql}"
+    ).first()["n"]
 
-
-    failed_sql = (
-        " OR ".join(
-            failed_conditions
-        )
-    )
-
-
-    n_failed_docs = (
+    if n_failed_rows and RETRY_FAILED:
 
         spark.sql(
-            f"""
-            SELECT COUNT(DISTINCT source_node) AS n
-            FROM {CHECKPOINT_TABLE}
-            WHERE {failed_sql}
-            """
-        )
-        .first()["n"]
-    )
-
-
-    # ------------------------------------------------------
-    # Remove failed documents so they can be reprocessed.
-    # ------------------------------------------------------
-
-    if (
-        n_failed_docs
-        and
-        RETRY_FAILED
-    ):
-
-        spark.sql(
-            f"""
-            DELETE FROM {CHECKPOINT_TABLE}
-            WHERE source_node IN (
-                SELECT source_node
-                FROM {CHECKPOINT_TABLE}
-                WHERE {failed_sql}
-            )
-            """
+            f"DELETE FROM {CHECKPOINT_TABLE} WHERE {failed_sql}"
         )
 
+        print(f"Failed targets deleted, queued for retry    : {n_failed_rows}")
+
+    elif n_failed_rows:
 
         print(
-            f"Failed documents queued for retry : "
-            f"{n_failed_docs}"
+            f"WARNING: {n_failed_rows} failed rows in the checkpoint "
+            f"(RETRY_FAILED=False, they will not be retried)."
         )
-
-
-    # ------------------------------------------------------
-    # Get completed documents.
-    # ------------------------------------------------------
 
     already_done = (
-
-        spark
-
-        .table(
-            CHECKPOINT_TABLE
-        )
-
-        .select(
-            "source_node"
-        )
-
+        spark.table(CHECKPOINT_TABLE)
+        .select(*KEY_COLS)
         .distinct()
     )
 
+    n_already_done = already_done.count()
 
-    n_already_done = (
-        already_done.count()
-    )
+    targets = targets.join(already_done, on=KEY_COLS, how="left_anti")
 
-
-    # ------------------------------------------------------
-    # Skip completed documents.
-    # ------------------------------------------------------
-
-    doc_prompt_inputs = (
-
-        doc_prompt_inputs
-
-        .join(
-            already_done,
-
-            on="source_node",
-
-            how="left_anti"
-        )
-    )
-
-
-    print(
-        f"Already checkpointed (skipped) : "
-        f"{n_already_done} documents"
-    )
-
+    print(f"Already checkpointed (skipped)              : {n_already_done} targets")
 
 else:
 
     print(
-        "No existing checkpoint table found."
+        "No existing checkpoint table found -- "
+        f"starting fresh at {CHECKPOINT_TABLE}"
     )
 
-    print(
-        "Starting fresh."
-    )
+n_to_process = targets.count()
 
-    print(
-        f"New checkpoint : "
-        f"{CHECKPOINT_TABLE}"
-    )
+print(f"Targets to process this run                 : {n_to_process}")
 
 
 # ==========================================================
-# 29. COUNT DOCUMENTS TO PROCESS
+# 3. RUN DISTRIBUTED EXTRACTION IN CHUNKS
+#
+# Each chunk is appended to the checkpoint table as soon as it
+# finishes, so a crash only loses the chunk in progress.
 # ==========================================================
 
-n_docs_to_process = (
-    doc_prompt_inputs.count()
-)
+if n_to_process == 0:
 
-
-print()
-print(
-    f"Documents to process this run : "
-    f"{n_docs_to_process}"
-)
-
-
-# ==========================================================
-# 30. RUN DISTRIBUTED EXTRACTION
-# ==========================================================
-
-if n_docs_to_process == 0:
-
-    print()
-
-    print(
-        "Nothing to do -- all documents already "
-        "checkpointed."
-    )
-
+    print("Nothing to do -- all targets already checkpointed.")
 
 else:
-
-    print()
-    print("=" * 80)
-    print("STARTING ITERATIVE LLM EXTRACTION")
-    print("=" * 80)
-
-    print()
-
-    print(
-        "Flow:"
-    )
-
-    print(
-        "Document"
-        " -> "
-        "Target"
-        " -> "
-        "Sentence"
-        " -> "
-        "6-word context"
-        " -> "
-        "LLM"
-        " -> "
-        "Predicate"
-    )
-
-
-    # ------------------------------------------------------
-    # Rows before this run.
-    # ------------------------------------------------------
 
     rows_before = (
-
-        spark.table(
-            CHECKPOINT_TABLE
-        ).count()
-
-        if table_exists
-
-        else 0
+        spark.table(CHECKPOINT_TABLE).count() if table_exists else 0
     )
 
+    n_chunks = max(1, -(-n_to_process // CHUNK_TARGETS))
 
-    # ------------------------------------------------------
-    # Number of chunks.
-    # ------------------------------------------------------
-
-    n_chunks = max(
-        1,
-        -(
-            -n_docs_to_process
-            //
-            CHUNK_DOCS
-        )
+    # even, stateless chunking by hash (no id lists collected)
+    chunked = targets.withColumn(
+        "_chunk_id",
+        F.pmod(F.hash(*KEY_COLS), F.lit(n_chunks))
     )
 
-
-    # ------------------------------------------------------
-    # Stateless chunk assignment.
-    # ------------------------------------------------------
-
-    chunked_inputs = (
-
-        doc_prompt_inputs
-
-        .withColumn(
-            "_chunk_id",
-
-            F.pmod(
-                F.hash(
-                    "source_node"
-                ),
-
-                F.lit(
-                    n_chunks
-                )
-            )
-        )
-    )
-
-
-    # ======================================================
-    # PROCESS CHUNKS
-    # ======================================================
-
-    for chunk_id in range(
-        n_chunks
-    ):
-
-        print()
-        print(
-            f"Processing chunk "
-            f"{chunk_id + 1}/{n_chunks}"
-        )
-
+    for chunk_id in range(n_chunks):
 
         chunk_df = (
-
-            chunked_inputs
-
-            .filter(
-                F.col(
-                    "_chunk_id"
-                )
-                ==
-                chunk_id
-            )
-
-            .drop(
-                "_chunk_id"
-            )
+            chunked
+            .filter(F.col("_chunk_id") == chunk_id)
+            .drop("_chunk_id")
         )
-
-
-        # --------------------------------------------------
-        # ONE TARGET -> ONE LLM CALL
-        # --------------------------------------------------
 
         (
-
             chunk_df
-
-            .repartition(
-                N_PARTITIONS
-            )
-
+            .repartition(N_PARTITIONS)
             .mapInPandas(
                 process_partition_pandas,
-
-                schema=
-                    TRIPLES_SCHEMA
+                schema=TRIPLES_SCHEMA
             )
-
             .write
-
-            .mode(
-                "append"
-            )
-
-            .option(
-                "mergeSchema",
-                "true"
-            )
-
-            .saveAsTable(
-                CHECKPOINT_TABLE
-            )
+            .mode("append")
+            .option("mergeSchema", "true")
+            .saveAsTable(CHECKPOINT_TABLE)
         )
 
+        print(f"  chunk {chunk_id + 1}/{n_chunks} saved")
 
-        print(
-            f"Chunk "
-            f"{chunk_id + 1}/{n_chunks}"
-            f" saved."
-        )
+    # Count from the SAVED table -- never from the lazy DataFrame,
+    # which would re-run every LLM call.
+    rows_after = spark.table(CHECKPOINT_TABLE).count()
 
-
-    # ------------------------------------------------------
-    # IMPORTANT:
-    #
-    # Count from SAVED checkpoint table.
-    #
-    # DO NOT call:
-    #
-    #     new_triples_df.count()
-    #
-    # because that could execute the LLM again.
-    # ------------------------------------------------------
-
-    rows_after = (
-
-        spark
-
-        .table(
-            CHECKPOINT_TABLE
-        )
-
-        .count()
-    )
-
-
-    print()
-
-    print(
-        f"Relationships extracted this run : "
-        f"{rows_after - rows_before}"
-    )
-
-
-    print(
-        f"Checkpointed to : "
-        f"{CHECKPOINT_TABLE}"
-    )
+    print(f"Relationships extracted this run            : {rows_after - rows_before}")
+    print(f"Checkpointed to                             : {CHECKPOINT_TABLE}")
 
 
 # ==========================================================
-# 31. LOAD COMPLETE RESULT
+# 4. LOAD RESULT
+#
+#   triples_all_df = everything in the checkpoint table
+#   triples_df     = usable rows only (feeds Cell 11 / 12)
 # ==========================================================
 
-if not spark.catalog.tableExists(
-    CHECKPOINT_TABLE
-):
+if not spark.catalog.tableExists(CHECKPOINT_TABLE):
 
     raise RuntimeError(
-        f"{CHECKPOINT_TABLE} does not exist."
+        f"{CHECKPOINT_TABLE} does not exist and there was nothing to "
+        f"process. Check sentences_df."
     )
 
+triples_all_df = spark.table(CHECKPOINT_TABLE)
 
-triples_df = (
+if "status" in triples_all_df.columns:
 
-    spark
-
-    .table(
-        CHECKPOINT_TABLE
+    # NULL status = rows written before the status column existed
+    triples_df = triples_all_df.filter(
+        (F.col("status") == "ok") | F.col("status").isNull()
     )
 
-    .cache()
-)
-
-
-n_total = (
-    triples_df.count()
-)
-
-
-print()
-print(
-    f"triples_df (all runs combined) row count : "
-    f"{n_total}"
-)
-
-
-# ==========================================================
-# 32. QUALITY SUMMARY
-# ==========================================================
-
-print()
-
-print(
-    "Rows by status:"
-)
-
-
-if "status" in triples_df.columns:
-
-    status_summary = (
-
-        triples_df
-
-        .groupBy(
-            "status"
-        )
-
-        .count()
-
-        .orderBy(
-            F.col(
-                "count"
-            ).desc()
-        )
-    )
-
+    status_col = F.coalesce(F.col("status"), F.lit("legacy"))
 
 else:
 
-    status_summary = (
+    triples_df = triples_all_df
+    status_col = F.lit("legacy")
 
-        triples_df
+triples_df = triples_df.cache()
 
-        .select(
-            F.lit(
-                "legacy"
-            ).alias(
-                "status"
-            )
-        )
+n_all = triples_all_df.count()
+n_usable = triples_df.count()
 
-        .groupBy(
-            "status"
-        )
+print()
+print(f"Rows in checkpoint table (all statuses) : {n_all}")
+print(f"triples_df (usable, feeds Cell 11)       : {n_usable}")
+print(f"Targets expected from sentences_df       : {n_targets_total}")
+print()
 
-        .count()
-    )
 
+# ==========================================================
+# 5. QUALITY SUMMARY
+# ==========================================================
+
+print("Rows by status (legacy = written before the status column existed):")
 
 display(
-    status_summary
+    triples_all_df
+    .groupBy(status_col.alias("status"))
+    .count()
+    .orderBy(F.col("count").desc())
+)
+
+if "status" in triples_all_df.columns:
+
+    n_bad = triples_all_df.filter(F.col("status") == "failed").count()
+
+    if n_bad:
+        print(
+            f"WARNING: {n_bad} targets failed (API errors / timeouts) and "
+            f"are NOT in triples_df. Re-run this cell to retry them."
+        )
+
+    n_parse = triples_all_df.filter(F.col("status") == "parse_error").count()
+
+    if n_parse:
+        print(
+            f"NOTE: {n_parse} targets returned an unparseable answer and "
+            f"are NOT in triples_df (look at their description)."
+        )
+
+if n_usable < n_targets_total:
+    print(
+        f"NOTE: triples_df has {n_targets_total - n_usable} fewer rows than "
+        f"targets in sentences_df (failed / parse_error / not yet run)."
+    )
+
+print()
+print("Top predicates (a long tail of near-duplicates = canonicalize later):")
+
+display(
+    triples_df
+    .groupBy("predicate")
+    .count()
+    .orderBy(F.col("count").desc())
+    .limit(25)
 )
 
 
 # ==========================================================
-# 33. FAILED ROW CHECK
-# ==========================================================
-
-if "status" in triples_df.columns:
-
-    n_failed_rows = (
-
-        triples_df
-
-        .filter(
-            F.col(
-                "status"
-            )
-            ==
-            "failed"
-        )
-
-        .count()
-    )
-
-
-    if n_failed_rows:
-
-        print(
-            f"WARNING: {n_failed_rows} rows failed."
-        )
-
-
-# ==========================================================
-# 34. DISPLAY FINAL TRIPLES
+# 6. SAMPLE TRIPLES
 # ==========================================================
 
 print()
-
-print(
-    "Sample triples:"
-)
-
-
-display_columns = [
-
-    c
-
-    for c in [
-
-        "source_title",
-
-        "predicate",
-
-        "relationship_strength",
-
-        "target_title",
-
-        "relationship_description",
-
-        "link_type",
-
-        "status",
-
-        "evidence_sentence",
-
-    ]
-
-    if c in triples_df.columns
-]
-
+print("Sample triples (source_title --[predicate, strength]--> target_title):")
 
 display(
     triples_df.select(
-        *display_columns
+        "source_title", "predicate", "relationship_strength",
+        "target_title", "relationship_description", "link_type",
+        "mention_count", "evidence_sentence"
     )
 )
