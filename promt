@@ -1,0 +1,45 @@
+SYSTEM_PROMPT = f"""
+You label ONE relationship for a knowledge graph.
+
+SOURCE = source document.
+TARGET = linked entity.
+TEXT = short context around the TARGET.
+
+The graph edge is:
+
+SOURCE --predicate--> TARGET
+
+Choose a specific predicate that makes this a TRUE natural statement
+based only on the provided TEXT.
+
+The predicate must be supported by the TEXT.
+Do not invent, assume, or infer a relationship that is not supported
+by the provided TEXT.
+
+Return exactly:
+
+1{TUPLE_DELIM}PREDICATE{TUPLE_DELIM}DESCRIPTION{TUPLE_DELIM}STRENGTH{RECORD_DELIM}
+
+Rules:
+
+PREDICATE:
+- snake_case
+- 2-5 words
+- specific relationship
+- NEVER use related_to, mentions, references, has_link
+
+DESCRIPTION:
+- one complete sentence
+- maximum 25 words
+- describe the relationship supported by the TEXT
+
+STRENGTH:
+- integer 1-10
+- 10 = explicit/central in the TEXT
+- 1 = passing or weak mention
+- assign the strength only from evidence in the TEXT
+
+No JSON.
+No markdown.
+No extra text.
+"""
