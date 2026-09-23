@@ -1,9 +1,22 @@
 # ==========================================================
-# Per-Document Node & Edge Count — TABLE VERSION
-# Works even if node_type=="document" tagging failed upstream
-# (falls back to structural root detection: in_degree == 0)
-# Needs: G (Cell 12)
+# Per-Document Node & Edge Count — FULL GENERIC VERSION
+#
+# Detects document nodes using a priority-ordered fallback chain,
+# so this works regardless of what succeeded/failed upstream:
+#
+#   Priority 1 : node_type=="document" tag on G's nodes
+#                (works only if Cell 12's DOC_QUERY matched)
+#   Priority 2 : recompute the exact URIs Cell 11 built from
+#                document_rendered_df (your actual loaded docs)
+#                (works even if DOC_QUERY / tagging failed)
+#   Priority 3 : structural fallback -- in_degree == 0
+#                (last resort if document_rendered_df isn't
+#                 available in this session either)
+#
+# Needs: G (Cell 12). document_rendered_df (Cell 8d) used if present.
 # ==========================================================
+import re
+import hashlib
 import networkx as nx
 import pandas as pd
 
@@ -11,23 +24,77 @@ print("=" * 80)
 print("NODES & EDGES PER DOCUMENT")
 print("=" * 80)
 
-# ---- Step 1: find document/root nodes -----------------------------------
-tagged_docs = [n for n, a in G.nodes(data=True) if a.get("node_type") == "document"]
+doc_nodes = []
+doc_labels = {}          # uri -> display label (fallback for nodes with no G label)
+detection_method = None
+missing_docs = []        # docs expected (Priority 2) but absent from G
 
-if tagged_docs:
-    doc_nodes = tagged_docs
-    print(f"Using node_type=='document' tag -> {len(doc_nodes)} document nodes found.\n")
-else:
+# ---- Priority 1: node_type == "document" tag -----------------------------
+tagged = [n for n, a in G.nodes(data=True) if a.get("node_type") == "document"]
+if tagged:
+    doc_nodes = tagged
+    detection_method = "node_type=='document' tag"
+
+# ---- Priority 2: recompute Cell 11's entity_uri() from document_rendered_df
+if not doc_nodes:
+    try:
+        from rdflib import Namespace, URIRef
+
+        BASE = "http://knwbt.local/kg/"
+        ENTITY_NS = Namespace(BASE + "entity/")
+
+        def _slugify(title: str) -> str:
+            s = re.sub(r"[^\w\s-]", "", title.strip())
+            s = re.sub(r"[\s-]+", "_", s)
+            return s.strip("_") or "unknown"
+
+        def entity_uri(title: str, reference: str) -> str:
+            short_hash = hashlib.md5(reference.encode()).hexdigest()[:8]
+            return str(URIRef(ENTITY_NS[f"{_slugify(title)}_{short_hash}"]))
+
+        expected_docs = {}   # uri -> title
+        for row in document_rendered_df.select("source_node", "source_title").toLocalIterator():
+            uri = entity_uri(row["source_title"], row["source_node"])
+            expected_docs[uri] = row["source_title"]
+
+        matched = [u for u in expected_docs if u in G.nodes]
+        missing_docs = [expected_docs[u] for u in expected_docs if u not in G.nodes]
+
+        if matched:
+            doc_nodes = matched
+            doc_labels = expected_docs
+            detection_method = "recomputed URI match against document_rendered_df"
+
+        print(f"Documents loaded (document_rendered_df) : {len(expected_docs)}")
+        print(f"Matched as nodes in G                   : {len(matched)}")
+        if missing_docs:
+            print(f"⚠️  {len(missing_docs)} document(s) never appear in G "
+                  f"(likely 0 extracted relationships):")
+            for t in missing_docs[:10]:
+                print(f"    - {t}")
+            if len(missing_docs) > 10:
+                print(f"    ... and {len(missing_docs) - 10} more")
+        print()
+
+    except NameError:
+        pass  # document_rendered_df not in this session -> fall through to Priority 3
+
+# ---- Priority 3: structural fallback (in_degree == 0) ---------------------
+if not doc_nodes:
     doc_nodes = [n for n in G.nodes() if G.in_degree(n) == 0]
-    print(f"⚠️  No nodes tagged node_type=='document' (upstream tagging failed).")
-    print(f"    Falling back to structural roots (in_degree == 0) -> {len(doc_nodes)} nodes found.\n")
+    detection_method = "structural fallback (in_degree == 0) -- LEAST reliable, " \
+                        "may miss docs that are also link targets"
 
-# ---- Step 2: per-document breakdown --------------------------------------
+print(f"Detection method used : {detection_method}")
+print(f"Document nodes found  : {len(doc_nodes)}")
+print()
+
+# ---- Per-document breakdown -------------------------------------------------
 rows = []
 covered_nodes = set()
 
 for doc in doc_nodes:
-    label = G.nodes[doc].get("label", doc)
+    label = G.nodes[doc].get("label", doc_labels.get(doc, doc))
     descendants = nx.descendants(G, doc)
     node_set = {doc} | descendants
     sub = G.subgraph(node_set)
@@ -40,34 +107,38 @@ for doc in doc_nodes:
     })
     covered_nodes |= node_set
 
-df = pd.DataFrame(rows).sort_values("Total Nodes (doc + entities)", ascending=False).reset_index(drop=True)
+df = pd.DataFrame(rows)
+if not df.empty:
+    df = df.sort_values("Total Nodes (doc + entities)", ascending=False).reset_index(drop=True)
 
-# ---- Step 3: show the table -----------------------------------------------
 try:
-    display(df)          # renders as a rich table in Databricks / Jupyter
+    display(df)
 except NameError:
-    print(df.to_string(index=False))
+    print(df.to_string(index=False) if not df.empty else "(no documents found)")
 
-# ---- Step 4: orphan nodes (not reachable from any document) ---------------
+# ---- Orphan nodes (not reachable from any detected document) --------------
 orphans = set(G.nodes()) - covered_nodes
 if orphans:
     orphan_df = pd.DataFrame(
         [{"Orphan Node": G.nodes[n].get("label", n)} for n in orphans]
     )
-    print(f"\n⚠️  {len(orphans)} node(s) not reachable from any document root:")
+    print(f"\n⚠️  {len(orphans)} node(s) not reachable from any detected document:")
     try:
         display(orphan_df)
     except NameError:
         print(orphan_df.to_string(index=False))
 
-# ---- Step 5: grand totals as a small summary table -------------------------
+# ---- Summary ------------------------------------------------------------------
 summary = pd.DataFrame([{
-    "Sum of per-doc nodes (shared entities counted per doc)": df["Total Nodes (doc + entities)"].sum(),
+    "Detection method": detection_method,
+    "Documents found": len(doc_nodes),
+    "Documents missing from G (Priority 2 only)": len(missing_docs),
+    "Sum of per-doc nodes (shared entities counted per doc)": int(df["Total Nodes (doc + entities)"].sum()) if not df.empty else 0,
     "Unique nodes covered by documents (dedup)": len(covered_nodes),
     "G.number_of_nodes() overall": G.number_of_nodes(),
     "G.number_of_edges() overall": G.number_of_edges(),
     "Orphan nodes": len(orphans),
-}]).T.rename(columns={0: "Count"})
+}]).T.rename(columns={0: "Value"})
 
 print()
 print("=" * 80)
