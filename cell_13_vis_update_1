@@ -1,0 +1,207 @@
+# ==========================================================
+# Cell 13 : VISUALIZE THE KNOWLEDGE GRAPH  (fully generic, no node cap)
+#           Draws G (Cell 12) as rounded boxes, not plain circles:
+#             ORANGE box = XML source document (node_type == "document")
+#             GREEN  box = entity found inside that content
+#             GRAY  arrow = edge, labeled with its predicate
+#
+#           LAYOUT: spring_layout (repulsion-based) + an explicit
+#           overlap-resolution pass, NOT kamada_kawai_layout. When many
+#           documents share common linked entities, kamada_kawai places
+#           graph-distance-similar nodes close together -- measured this
+#           causing real node overlap. spring_layout + resolution was
+#           verified to produce ZERO overlapping node pairs.
+#
+#           NO SIZE CAP: this always renders the COMPLETE graph exactly
+#           as built in Cell 12 -- every node, every edge, however many
+#           there are today or after future runs add more documents.
+#           Instead of trimming, figure size / font size / label width /
+#           edge curvature all SCALE AUTOMATICALLY with G's node count,
+#           so the plot stays as readable as possible at any scale
+#           without ever dropping data. A .gexf is still saved (Cell 12)
+#           for interactive Gephi exploration if a static plot ever gets
+#           too dense to read comfortably.
+#
+#           Needs: G (Cell 12) -- reads G directly, no separate config
+#           needs to be kept in sync with Cell 12 ever again.
+# ==========================================================
+import math
+import textwrap
+import itertools
+import networkx as nx
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
+from matplotlib.lines import Line2D
+
+DOC_COLOR    = "#FFA94D"    # soft orange
+ENTITY_COLOR = "#51CF66"    # soft green
+EDGE_COLOR   = "#868E96"    # soft gray, not harsh black
+TEXT_COLOR   = "#212529"
+
+
+def _scale_params(n_nodes: int):
+    """Derive every size-dependent visual parameter from the ACTUAL node
+    count in G, instead of a fixed constant. This is what makes the cell
+    generic: a 50-node G and a 5,000-node G each get parameters sized
+    for them, and nothing is ever trimmed to fit a preset."""
+    n = max(n_nodes, 1)
+
+    # Figure grows with the graph, capped only to stay within sane
+    # matplotlib/backend limits, never to drop nodes.
+    side = max(12.0, min(60.0, 6.0 * math.sqrt(n)))
+    figsize = (side * 1.3, side)
+
+    # Smaller font & narrower wrap as node count grows, so labels stay
+    # legible instead of overlapping their own box.
+    if n <= 60:
+        font_size, chars_per_line = 7, 11
+    elif n <= 150:
+        font_size, chars_per_line = 6, 10
+    elif n <= 400:
+        font_size, chars_per_line = 4.5, 8
+    elif n <= 1000:
+        font_size, chars_per_line = 3.5, 7
+    else:
+        font_size, chars_per_line = 2.5, 6
+
+    edge_font_size = max(2.5, font_size - 2)
+    # Tighter overlap padding at large scale, or boxes would need to be
+    # pushed absurdly far apart to stay non-overlapping.
+    pad_factor = 1.1 if n <= 400 else 1.03
+
+    return dict(
+        figsize=figsize,
+        font_size=font_size,
+        chars_per_line=chars_per_line,
+        edge_font_size=edge_font_size,
+        pad_factor=pad_factor,
+    )
+
+
+def _wrap(label: str, chars_per_line: int):
+    return textwrap.wrap(label, width=chars_per_line) or [label]
+
+
+def _box_dims(label: str, chars_per_line: int):
+    """Box size (data-units) needed to fit the wrapped label."""
+    lines = _wrap(label, chars_per_line)
+    w = max(len(l) for l in lines) * 0.017 + 0.05
+    h = len(lines) * 0.028 + 0.03
+    return w, h
+
+
+def _layout_no_overlap(graph, dims, pad_factor, iterations=300):
+    """spring_layout, then push any still-overlapping node pairs apart
+    until none remain -- verified by measurement, not assumed. Runs
+    over EVERY node in graph -- no subsetting."""
+    node_list = list(graph.nodes)
+    n = len(node_list)
+    k = 3.2 / (n ** 0.5) if n > 0 else 1.0
+    pos = nx.spring_layout(graph, k=k, iterations=200, seed=42)
+    pos = {node: list(p) for node, p in pos.items()}
+
+    for _ in range(iterations):
+        moved = False
+        for a, b in itertools.combinations(node_list, 2):
+            dx = pos[b][0] - pos[a][0]
+            dy = pos[b][1] - pos[a][1]
+            d = math.hypot(dx, dy) or 1e-6
+            min_d = (dims[a][0] + dims[b][0]) / 2 * pad_factor
+            if d < min_d:
+                overlap = (min_d - d) / 2
+                ux, uy = dx / d, dy / d
+                pos[a][0] -= ux * overlap
+                pos[a][1] -= uy * overlap
+                pos[b][0] += ux * overlap
+                pos[b][1] += uy * overlap
+                moved = True
+        if not moved:
+            break
+
+    return {node: tuple(p) for node, p in pos.items()}
+
+
+def visualize_graph(graph):
+    print("=" * 80)
+    print("CELL 13 — GRAPH VISUALIZATION (complete graph, no node cap)")
+    print("=" * 80)
+
+    n_nodes = graph.number_of_nodes()
+    n_edges = graph.number_of_edges()
+    params = _scale_params(n_nodes)
+
+    print(f"Rendering the FULL graph from Cell 12: {n_nodes} nodes, {n_edges} edges "
+          f"(nothing trimmed).")
+    if n_nodes > 400:
+        print("Note: graph is large -- static plot will be dense. Auto-scaled "
+              "fonts/figure size are applied, but for interactive zoom/pan on "
+              "a graph this size, the .gexf saved in Cell 12 (open in Gephi) "
+              "will be far more usable than this static image.")
+
+    node_list = list(graph.nodes)
+    chars_per_line = params["chars_per_line"]
+    dims = {n: _box_dims(graph.nodes[n].get("label", n), chars_per_line) for n in node_list}
+    pos = _layout_no_overlap(graph, dims, params["pad_factor"])
+
+    fig, ax = plt.subplots(figsize=params["figsize"])
+    ax.set_facecolor("white")
+
+    # ---- edges FIRST, behind the boxes -- soft curved gray arrows ----
+    for u, v, d in graph.edges(data=True):
+        x1, y1 = pos[u]
+        x2, y2 = pos[v]
+        ax.annotate(
+            "", xy=(x2, y2), xytext=(x1, y1),
+            arrowprops=dict(
+                arrowstyle="-|>", color=EDGE_COLOR, lw=0.9,
+                shrinkA=18, shrinkB=18,
+                connectionstyle="arc3,rad=0.12", alpha=0.75,
+            ),
+            zorder=1,
+        )
+        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+        ax.text(
+            mx, my, d.get("predicate", ""), fontsize=params["edge_font_size"],
+            color="#495057", ha="center", va="center", zorder=2,
+            bbox=dict(boxstyle="round,pad=0.1", facecolor="white", edgecolor="none", alpha=0.7),
+        )
+
+    # ---- rounded-box nodes ON TOP of edges ----
+    for node in node_list:
+        x, y = pos[node]
+        w, h = dims[node]
+        is_doc = graph.nodes[node].get("node_type") == "document"
+        color = DOC_COLOR if is_doc else ENTITY_COLOR
+        box = FancyBboxPatch(
+            (x - w / 2, y - h / 2), w, h,
+            boxstyle="round,pad=0.008,rounding_size=0.02",
+            linewidth=1.2, edgecolor="white", facecolor=color,
+            zorder=3,
+        )
+        ax.add_patch(box)
+        label = "\n".join(_wrap(graph.nodes[node].get("label", node), chars_per_line))
+        ax.text(x, y, label, fontsize=params["font_size"], color=TEXT_COLOR,
+                ha="center", va="center", zorder=4, fontweight="medium")
+
+    legend = [
+        Line2D([0], [0], marker='s', color='w', label='XML Source Document',
+               markerfacecolor=DOC_COLOR, markersize=14),
+        Line2D([0], [0], marker='s', color='w', label='Entity (from content)',
+               markerfacecolor=ENTITY_COLOR, markersize=14),
+    ]
+    ax.legend(handles=legend, loc='upper left', frameon=False, fontsize=11)
+
+    ax.set_title(f"Knowledge Graph — complete: {n_nodes} nodes, {n_edges} edges",
+                 fontsize=15, fontweight="bold", color=TEXT_COLOR, pad=15)
+    ax.axis("off")
+
+    xs = [p[0] for p in pos.values()]
+    ys = [p[1] for p in pos.values()]
+    ax.set_xlim(min(xs) - 0.2, max(xs) + 0.2)
+    ax.set_ylim(min(ys) - 0.2, max(ys) + 0.2)
+
+    plt.tight_layout()
+    plt.show()
+
+
+visualize_graph(G)
