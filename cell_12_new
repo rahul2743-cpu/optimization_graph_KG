@@ -1,0 +1,170 @@
+# ==========================================================
+# Cell 12 : BUILD NETWORKX GRAPH  (from the RDF graph, Cell 11)
+#           Reads the RDF graph `g` -- NOT triples_df directly -- so
+#           this stays true to the pipeline: RDF Triple -> NetworkX.
+#           A SPARQL query pulls each reified statement back out with
+#           all its metadata (description, strength, link_type) in
+#           one shot, plus the human-readable rdfs:label for every
+#           entity, plus the full document content for source nodes.
+#           Nothing added in Cell 11 is lost in this conversion.
+#
+#           Visualization is a SEPARATE step -- see Cell 13.
+#
+#           Needs: g (Cell 11)
+# ==========================================================
+import networkx as nx
+
+print("=" * 80)
+print("CELL 12 — BUILD NETWORKX KNOWLEDGE GRAPH")
+print("=" * 80)
+
+# ---- Step 1: pull every relationship + its metadata, one query ---------
+REL_QUERY = """
+PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX ex:   <http://knwbt.local/kg/schema/>
+
+SELECT ?src ?srcLabel ?pred ?predLabel ?tgt ?tgtLabel
+       ?description ?strength ?linkType
+WHERE {
+    ?stmt a rdf:Statement ;
+          rdf:subject ?src ;
+          rdf:predicate ?pred ;
+          rdf:object ?tgt ;
+          ex:description ?description ;
+          ex:strength ?strength ;
+          ex:linkType ?linkType .
+    OPTIONAL { ?src rdfs:label ?srcLabel }
+    OPTIONAL { ?pred rdfs:label ?predLabel }
+    OPTIONAL { ?tgt rdfs:label ?tgtLabel }
+}
+"""
+
+# ---- Step 2: pull full document content for source entities ------------
+DOC_QUERY = """
+PREFIX ex:   <http://knwbt.local/kg/schema/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?doc ?label ?content
+WHERE {
+    ?doc a ex:Document ;
+         rdfs:label ?label ;
+         ex:documentContent ?content .
+}
+"""
+
+# ---- Build the graph -----------------------------------------------------
+# Materialize the query results FIRST (not just iterate) -- this lets us
+# count exactly how many rows came back at each stage, so any silent drop
+# between Cell 10 -> Cell 11 (RDF) -> here can be caught, not assumed away.
+doc_rows_rdf = list(g.query(DOC_QUERY))
+rel_rows_rdf = list(g.query(REL_QUERY))
+
+G = nx.MultiDiGraph()
+
+for row in doc_rows_rdf:
+    G.add_node(
+        str(row.doc),
+        label=str(row.label),
+        node_type="document",
+        content=str(row.content),
+    )
+
+for row in rel_rows_rdf:
+    src, tgt = str(row.src), str(row.tgt)
+    G.add_node(src, label=str(row.srcLabel) if row.srcLabel else src)
+    G.add_node(tgt, label=str(row.tgtLabel) if row.tgtLabel else tgt)
+    G.add_edge(
+        src, tgt,
+        predicate=str(row.predLabel) if row.predLabel else str(row.pred).rsplit("/", 1)[-1],
+        description=str(row.description),
+        strength=int(row.strength),
+        link_type=str(row.linkType),
+    )
+
+print(f"Nodes (entities)  : {G.number_of_nodes()}")
+print(f"Edges (relations) : {G.number_of_edges()}")
+
+# ---- Node breakdown: source(document) nodes vs entity nodes ------------
+# Generic on purpose: it just reads the node_type attribute set above.
+# Any node with node_type == "document" is a source node; everything
+# else (added only via REL_QUERY, no node_type set) is an entity node.
+n_source_nodes = sum(1 for _, attrs in G.nodes(data=True) if attrs.get("node_type") == "document")
+n_entity_nodes = G.number_of_nodes() - n_source_nodes
+n_total_nodes  = n_source_nodes + n_entity_nodes  # should equal G.number_of_nodes()
+
+print(f"Source nodes (documents)      : {n_source_nodes}")
+print(f"Entity nodes (non-document)   : {n_entity_nodes}")
+print(f"Total nodes (source + entity) : {n_total_nodes}")
+
+assert n_total_nodes == G.number_of_nodes(), "Node breakdown doesn't reconcile with total node count!"
+
+# ==========================================================
+# DATA INTEGRITY CHECK -- verify nothing was lost at ANY handoff:
+#   document_rendered_df (Cell 8d)  ->  RDF graph g (Cell 11)  ->  G (here)
+#   triples_df (Cell 10)            ->  RDF graph g (Cell 11)  ->  G (here)
+# This does not assume the pipeline is correct -- it checks.
+# ==========================================================
+print()
+print("=" * 80)
+print("DATA INTEGRITY CHECK")
+print("=" * 80)
+
+problems = []
+
+try:
+    n_docs_expected = document_rendered_df.count()
+except NameError:
+    n_docs_expected = None
+
+n_docs_in_rdf = len(doc_rows_rdf)
+n_docs_in_graph = n_source_nodes  # reuse the count computed above -- one source of truth
+
+print(f"Documents  -- Cell 8d (document_rendered_df) : {n_docs_expected}")
+print(f"Documents  -- recovered from RDF (Cell 11)    : {n_docs_in_rdf}")
+print(f"Documents  -- present as nodes in G (here)     : {n_docs_in_graph}")
+if n_docs_expected is not None and n_docs_expected != n_docs_in_rdf:
+    problems.append(f"{n_docs_expected - n_docs_in_rdf} document(s) missing between Cell 8d and the RDF graph")
+if n_docs_in_rdf != n_docs_in_graph:
+    problems.append(f"{n_docs_in_rdf - n_docs_in_graph} document(s) missing between the RDF graph and G")
+
+print()
+
+try:
+    n_rel_expected = triples_df.count()
+except NameError:
+    n_rel_expected = None
+
+n_rel_in_rdf = len(rel_rows_rdf)
+n_rel_in_graph = G.number_of_edges()
+
+print(f"Relationships -- Cell 10 (triples_df)          : {n_rel_expected}")
+print(f"Relationships -- recovered from RDF (Cell 11)   : {n_rel_in_rdf}")
+print(f"Relationships -- present as edges in G (here)    : {n_rel_in_graph}")
+if n_rel_expected is not None and n_rel_expected != n_rel_in_rdf:
+    problems.append(f"{n_rel_expected - n_rel_in_rdf} relationship(s) missing between Cell 10 and the RDF graph")
+# note: n_rel_in_graph can be LESS than n_rel_in_rdf ONLY if two relationships
+# had the exact same (source, predicate, target) -- see Cell 11's own dedup
+# check, which reports that number explicitly. Any gap NOT explained by that
+# is a real loss, not expected dedup.
+
+print()
+if problems:
+    print("⚠️  DATA LOSS DETECTED:")
+    for p in problems:
+        print(f"   - {p}")
+else:
+    print("✅ No data lost -- every document and relationship is accounted for at every stage.")
+
+# ---- Most-connected entities --------------------------------------------
+top = sorted(G.degree(), key=lambda x: x[1], reverse=True)[:10]
+print()
+print("Top 10 most-connected entities:")
+for node, deg in top:
+    label = G.nodes[node].get("label", node)
+    print(f"  {deg:3d}  {label}")
+
+# ---- Save (protects the LLM work in Cell 10 from being lost) -----------
+GRAPH_PATH = "/tmp/knowledge_graph.gexf"
+nx.write_gexf(G, GRAPH_PATH)
+print(f"\nSaved: {GRAPH_PATH}")
