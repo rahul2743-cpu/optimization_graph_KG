@@ -1,0 +1,80 @@
+# ================================================================
+# Cell 13 : VISUALIZE THE KNOWLEDGE GRAPH (PyVis, interactive, no cap)
+#           Always renders the COMPLETE graph from Cell 12 -- every
+#           node, every edge -- however many there are today or after
+#           future runs add more documents/entities. PyVis is already
+#           well-suited to this: it's an interactive, zoomable/pannable
+#           HTML canvas (physics-based layout), not a static image, so
+#           there's no real need to trim for readability the way a
+#           static matplotlib plot would.
+#           Needs: G (Cell 12) -- reads G directly and always reflects
+#           its true size, no separate constant to keep in sync.
+# ================================================================
+import subprocess
+subprocess.check_call(["pip", "install", "-q", "pyvis"])
+from pyvis.network import Network
+
+print("=" * 80)
+print("CELL 13 — GRAPH VISUALIZATION (PyVis, interactive, complete graph)")
+print("=" * 80)
+
+DOC_COLOR    = "#f4a261"
+ENTITY_COLOR = "#bcdff1"
+OUTPUT_PATH  = "kg_full.html"
+
+# No _select_subgraph / MAX_NODES anymore -- `view` IS `G`, always.
+view = G
+
+n_nodes = view.number_of_nodes()
+n_edges = view.number_of_edges()
+print(f"Rendering the FULL graph: {n_nodes} nodes, {n_edges} edges (nothing trimmed).")
+
+# Physics settings scale a bit with graph size so it doesn't look like a
+# tangled hairball or take forever to settle at larger scale -- still
+# renders 100% of nodes/edges either way, this only affects layout feel.
+gravity = -15000 if n_nodes <= 300 else -30000
+spring_length = 300 if n_nodes <= 300 else 150
+
+net = Network(height="900px", width="100%", directed=True,
+              bgcolor="#ffffff", notebook=False, cdn_resources="in_line")
+net.barnes_hut(gravity=gravity, spring_length=spring_length)
+
+# degree computed ONCE up front, not re-queried per node in the loop below
+degrees = dict(view.degree())
+
+for n, d in view.nodes(data=True):
+    is_doc = d.get("node_type") == "document"
+    label = d.get("label", n)
+    deg = degrees[n]
+
+    tooltip = f"{label}\n{n}\ndegree={deg}"
+    if is_doc and d.get("content"):
+        tooltip += f"\n\n{d['content'][:200]}..."
+    if d.get("community_path"):                # only present if Cell 17 has run
+        tooltip += f"\ncommunity={d['community_path']}"
+
+    net.add_node(
+        n,
+        label=label[:22],              # truncated for on-screen readability
+        title=tooltip,                 # FULL detail on hover, not truncated
+        shape="box",                   # rounded box, not a plain circle
+        size=14 + deg * 3 if is_doc else 8 + deg,
+        color=DOC_COLOR if is_doc else ENTITY_COLOR,
+    )
+
+for u, v, d in view.edges(data=True):
+    predicate = d.get("predicate", "")
+    strength = d.get("strength", d.get("relationship_strength", 5))
+    description = d.get("description", d.get("relationship_description", ""))
+    net.add_edge(
+        u, v,
+        label=predicate,                       # predicate shown on EVERY edge
+        title=f"{predicate}\nstrength={strength}/10\n{description}",
+        width=0.5 + (strength / 10) * 2.5,     # stronger relationships render thicker
+    )
+
+net.write_html(OUTPUT_PATH)
+with open(OUTPUT_PATH) as f:
+    displayHTML(f.read())
+
+print(f"\nSaved: {OUTPUT_PATH} — {n_nodes} nodes / {n_edges} edges, all rendered")
