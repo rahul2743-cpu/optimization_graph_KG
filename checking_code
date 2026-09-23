@@ -1,44 +1,79 @@
 # ==========================================================
-# Per-Document Node Count (Doc source + its child/entity nodes)
+# Per-Document Node & Edge Count — TABLE VERSION
+# Works even if node_type=="document" tagging failed upstream
+# (falls back to structural root detection: in_degree == 0)
 # Needs: G (Cell 12)
 # ==========================================================
 import networkx as nx
-
-doc_nodes = [n for n, a in G.nodes(data=True) if a.get("node_type") == "document"]
+import pandas as pd
 
 print("=" * 80)
-print("NODES PER DOCUMENT")
+print("NODES & EDGES PER DOCUMENT")
 print("=" * 80)
 
-per_doc_counts = {}
-union_of_all_doc_subgraphs = set()
+# ---- Step 1: find document/root nodes -----------------------------------
+tagged_docs = [n for n, a in G.nodes(data=True) if a.get("node_type") == "document"]
+
+if tagged_docs:
+    doc_nodes = tagged_docs
+    print(f"Using node_type=='document' tag -> {len(doc_nodes)} document nodes found.\n")
+else:
+    doc_nodes = [n for n in G.nodes() if G.in_degree(n) == 0]
+    print(f"⚠️  No nodes tagged node_type=='document' (upstream tagging failed).")
+    print(f"    Falling back to structural roots (in_degree == 0) -> {len(doc_nodes)} nodes found.\n")
+
+# ---- Step 2: per-document breakdown --------------------------------------
+rows = []
+covered_nodes = set()
 
 for doc in doc_nodes:
     label = G.nodes[doc].get("label", doc)
+    descendants = nx.descendants(G, doc)
+    node_set = {doc} | descendants
+    sub = G.subgraph(node_set)
 
-    # DIRECT children only (1-hop entities linked straight from this doc)
-    direct_children = set(G.successors(doc))
+    rows.append({
+        "Document": label,
+        "Total Nodes (doc + entities)": len(node_set),
+        "Child Entities": len(descendants),
+        "Edges": sub.number_of_edges(),
+    })
+    covered_nodes |= node_set
 
-    # FULL reachable subtree (entities linked to entities, transitively)
-    all_descendants = nx.descendants(G, doc)
+df = pd.DataFrame(rows).sort_values("Total Nodes (doc + entities)", ascending=False).reset_index(drop=True)
 
-    per_doc_counts[label] = {
-        "direct_children": len(direct_children),
-        "total_reachable": len(all_descendants),
-        "total_with_source": len(all_descendants) + 1,  # +1 for the doc node itself
-    }
-    union_of_all_doc_subgraphs |= ({doc} | all_descendants)
+# ---- Step 3: show the table -----------------------------------------------
+try:
+    display(df)          # renders as a rich table in Databricks / Jupyter
+except NameError:
+    print(df.to_string(index=False))
 
-# ---- print per-document table ----
-for label, c in sorted(per_doc_counts.items(), key=lambda x: -x[1]["total_with_source"]):
-    print(f"{label:40s} : {c['total_with_source']:4d} nodes  "
-          f"(1 source + {c['direct_children']} direct entities, "
-          f"{c['total_reachable']} total reachable)")
+# ---- Step 4: orphan nodes (not reachable from any document) ---------------
+orphans = set(G.nodes()) - covered_nodes
+if orphans:
+    orphan_df = pd.DataFrame(
+        [{"Orphan Node": G.nodes[n].get("label", n)} for n in orphans]
+    )
+    print(f"\n⚠️  {len(orphans)} node(s) not reachable from any document root:")
+    try:
+        display(orphan_df)
+    except NameError:
+        print(orphan_df.to_string(index=False))
 
-# ---- grand totals ----
+# ---- Step 5: grand totals as a small summary table -------------------------
+summary = pd.DataFrame([{
+    "Sum of per-doc nodes (shared entities counted per doc)": df["Total Nodes (doc + entities)"].sum(),
+    "Unique nodes covered by documents (dedup)": len(covered_nodes),
+    "G.number_of_nodes() overall": G.number_of_nodes(),
+    "G.number_of_edges() overall": G.number_of_edges(),
+    "Orphan nodes": len(orphans),
+}]).T.rename(columns={0: "Count"})
+
 print()
 print("=" * 80)
-sum_including_overlap = sum(c["total_with_source"] for c in per_doc_counts.values())
-print(f"Sum of per-document node counts (entities shared across docs counted more than once): {sum_including_overlap}")
-print(f"Unique nodes across all documents combined (dedup)                                  : {len(union_of_all_doc_subgraphs)}")
-print(f"G.number_of_nodes() overall (should match/exceed the dedup number above)              : {G.number_of_nodes()}")
+print("SUMMARY")
+print("=" * 80)
+try:
+    display(summary)
+except NameError:
+    print(summary.to_string())
