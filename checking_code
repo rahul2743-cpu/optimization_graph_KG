@@ -1,0 +1,44 @@
+# ==========================================================
+# Per-Document Node Count (Doc source + its child/entity nodes)
+# Needs: G (Cell 12)
+# ==========================================================
+import networkx as nx
+
+doc_nodes = [n for n, a in G.nodes(data=True) if a.get("node_type") == "document"]
+
+print("=" * 80)
+print("NODES PER DOCUMENT")
+print("=" * 80)
+
+per_doc_counts = {}
+union_of_all_doc_subgraphs = set()
+
+for doc in doc_nodes:
+    label = G.nodes[doc].get("label", doc)
+
+    # DIRECT children only (1-hop entities linked straight from this doc)
+    direct_children = set(G.successors(doc))
+
+    # FULL reachable subtree (entities linked to entities, transitively)
+    all_descendants = nx.descendants(G, doc)
+
+    per_doc_counts[label] = {
+        "direct_children": len(direct_children),
+        "total_reachable": len(all_descendants),
+        "total_with_source": len(all_descendants) + 1,  # +1 for the doc node itself
+    }
+    union_of_all_doc_subgraphs |= ({doc} | all_descendants)
+
+# ---- print per-document table ----
+for label, c in sorted(per_doc_counts.items(), key=lambda x: -x[1]["total_with_source"]):
+    print(f"{label:40s} : {c['total_with_source']:4d} nodes  "
+          f"(1 source + {c['direct_children']} direct entities, "
+          f"{c['total_reachable']} total reachable)")
+
+# ---- grand totals ----
+print()
+print("=" * 80)
+sum_including_overlap = sum(c["total_with_source"] for c in per_doc_counts.values())
+print(f"Sum of per-document node counts (entities shared across docs counted more than once): {sum_including_overlap}")
+print(f"Unique nodes across all documents combined (dedup)                                  : {len(union_of_all_doc_subgraphs)}")
+print(f"G.number_of_nodes() overall (should match/exceed the dedup number above)              : {G.number_of_nodes()}")
