@@ -1,0 +1,262 @@
+# ==========================================================
+# Cell 16 : LINKING + TRAVERSAL  (SPARQL, no LLM)
+#
+#   ITERATED, NOT A PROPERTY PATH: SPARQL property paths require fixed
+#   predicate IRIs -- variables are illegal inside a path -- and the
+#   {n,m} cardinality forms were removed from SPARQL 1.1 before it was
+#   finalised. With distinct predicates per relationship, the options
+#   are a chained-statement query or an iterated 1-hop query. Iterating
+#   wins: rdflib evaluates a chained double-statement pattern as a
+#   near-cartesian join, and each hop multiplies it again.
+#
+#   OUTGOING ONLY: Cell 10 writes document -> entity edges, and
+#   retrieval should only follow a document's OWN outgoing links --
+#   like reading a wiki page and clicking the blue links inside it,
+#   never pulling in other pages just because they also happen to
+#   link to the same target (that's a backlink, not this page's
+#   content). NEIGHBOUR_QUERY_TMPL enforces this with VALUES ?src
+#   (not ?seed + an OR filter) -- a seed can only ever be matched as
+#   the subject, never the object.
+#
+#   GROUNDING (the one deliberate exception): a bare entity seed (a
+#   component, parameter -- never itself a page) has NO outgoing
+#   edges in this schema, since only documents are ever ?src.
+#   GROUNDING_QUERY_TMPL does exactly ONE VALUES ?tgt lookup for such
+#   a seed, to find its home document -- NOT to pull in every
+#   document that happens to mention it, just the fact that a
+#   document contains it. That home document then becomes a normal
+#   frontier node, and every hop after that is outgoing-only again,
+#   same as any other document.
+#
+#   WHY src is still added to next_frontier below, and why seed_score
+#   still looks at both sides: for an ordinary outgoing row, `src` is
+#   already a visited frontier node -- adding it again is a no-op, it
+#   changes nothing. But for a GROUNDING row specifically, `src` is
+#   the newly-discovered home document (not yet visited) and `tgt` is
+#   the already-visited entity seed -- the direction is flipped
+#   because the query itself was VALUES ?tgt. Dropping the src-branch
+#   or the tgt-side max() here silently kills grounding after hop 1:
+#   the home document would never enter the frontier, and its
+#   seed_score would collapse to 0, zeroing out its rank. This is not
+#   leftover bidirectional logic -- it is the one place grounding
+#   still needs both sides of the edge.
+# ==========================================================
+print("=" * 80)
+print("CELL 16 — LINKING + TRAVERSAL")
+print("=" * 80)
+
+NEIGHBOUR_QUERY_TMPL = PREFIXES + """
+SELECT ?src ?srcLabel ?pred ?predLabel ?tgt ?tgtLabel
+       ?description ?strength ?linkType
+WHERE {
+    VALUES ?src { %SEEDS% }
+    ?stmt a rdf:Statement ;
+          rdf:subject   ?src ;
+          rdf:predicate ?pred ;
+          rdf:object    ?tgt ;
+          ex:description ?description ;
+          ex:strength    ?strength ;
+          ex:linkType    ?linkType .
+    FILTER(LCASE(STR(?linkType)) != "doc:wiki")
+    OPTIONAL { ?src  rdfs:label ?srcLabel }
+    OPTIONAL { ?tgt  rdfs:label ?tgtLabel }
+    OPTIONAL { ?pred rdfs:label ?predLabel }
+}
+"""
+
+# Used ONLY to locate the home document of a bare entity seed that has
+# no outgoing edges of its own -- never to expand into sibling documents.
+GROUNDING_QUERY_TMPL = PREFIXES + """
+SELECT ?src ?srcLabel ?pred ?predLabel ?tgt ?tgtLabel
+       ?description ?strength ?linkType
+WHERE {
+    VALUES ?tgt { %SEEDS% }
+    ?stmt a rdf:Statement ;
+          rdf:subject   ?src ;
+          rdf:predicate ?pred ;
+          rdf:object    ?tgt ;
+          ex:description ?description ;
+          ex:strength    ?strength ;
+          ex:linkType    ?linkType .
+    FILTER(LCASE(STR(?linkType)) != "doc:wiki")
+    OPTIONAL { ?src  rdfs:label ?srcLabel }
+    OPTIONAL { ?tgt  rdfs:label ?tgtLabel }
+    OPTIONAL { ?pred rdfs:label ?predLabel }
+}
+"""
+
+DOC_CONTENT_TMPL = PREFIXES + """
+SELECT ?doc ?label ?content
+WHERE {
+    VALUES ?doc { %DOCS% }
+    ?doc ex:documentContent ?content .
+    OPTIONAL { ?doc rdfs:label ?label }
+}
+"""
+
+SUBSTRING_TMPL = PREFIXES + """
+SELECT DISTINCT ?node ?label
+WHERE {
+    ?node rdfs:label ?label .
+    FILTER(CONTAINS(LCASE(STR(?label)), %PHRASE%))
+    FILTER(!STRSTARTS(STR(?node), "%PREDMARK%"))
+}
+LIMIT 10
+"""
+
+_STOP = {"the", "a", "an", "of", "for", "and", "or", "to", "in", "on", "is",
+         "are", "what", "which", "how", "does", "do", "with", "by", "from"}
+
+
+def _tokens(s):
+    return {t for t in re.findall(r"[a-z0-9]+", (s or "").lower())
+            if t not in _STOP and len(t) > 2}
+
+
+def _values_block(uris):
+    return " ".join(f"<{u}>" for u in uris if "<" not in u and ">" not in u)
+
+
+def _sparql_literal(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def link_entities(phrases):
+    """Phrases -> [(node, label, score, phrase)]. Two passes: SPARQL
+    substring for precision, fuzzy for recall."""
+    best = {}
+    for phrase, _cls in phrases:
+        q = (SUBSTRING_TMPL
+             .replace("%PHRASE%", _sparql_literal(phrase.lower()))
+             .replace("%PREDMARK%", PREDICATE_MARKER))
+        try:
+            for row in g.query(q):
+                node = str(row.node)
+                if best.get(node, (0,))[0] < 95:
+                    best[node] = (95.0, phrase)
+        except Exception as e:
+            print(f"  substring query failed for {phrase!r}: {e}")
+
+        for label_lc, score in fuzzy_match(phrase.lower(), ALL_LABELS,
+                                           MAX_SEEDS_PER_PHRASE, MATCH_CUTOFF):
+            for node in LABEL_TO_NODES[label_lc]:
+                if node not in best or score > best[node][0]:
+                    best[node] = (score, phrase)
+
+    return [(n, NODE_LABEL.get(n, n), s, p)
+            for n, (s, p) in sorted(best.items(), key=lambda kv: kv[1][0], reverse=True)]
+
+
+def lexical_fallback(question, limit=5):
+    """No LLM, no embeddings. Used when extraction returns nothing or
+    nothing links."""
+    q_tokens = _tokens(question)
+    if not q_tokens:
+        return []
+    scored = []
+    for label_lc, nodes in LABEL_TO_NODES.items():
+        overlap = q_tokens & _tokens(label_lc)
+        if overlap:
+            score = 100.0 * len(overlap) / max(len(_tokens(label_lc)), 1)
+            for n in nodes:
+                scored.append((n, NODE_LABEL.get(n, n), min(score, 99.0), "lexical"))
+    scored.sort(key=lambda x: x[2], reverse=True)
+    return scored[:limit]
+
+
+def _row_to_edge(row, hop, seed_score):
+    src, tgt = str(row.src), str(row.tgt)
+    pred = str(row.predLabel) if row.predLabel else str(row.pred).rsplit("/", 1)[-1]
+    return src, tgt, {
+        "source": src,
+        "source_label": str(row.srcLabel) if row.srcLabel else NODE_LABEL.get(src, src),
+        "predicate": pred,
+        "target": tgt,
+        "target_label": str(row.tgtLabel) if row.tgtLabel else NODE_LABEL.get(tgt, tgt),
+        "description": str(row.description),
+        "strength": int(row.strength),
+        "link_type": str(row.linkType),
+        "hop": hop,
+        "seed_score": seed_score,
+    }
+
+
+def traverse(seeds):
+    """OUTGOING ONLY, hop by hop -- exactly like clicking the blue links
+    INSIDE a wiki page, never the backlinks from other pages that happen
+    to mention the same term.
+
+    Documents are always ?src in this schema. A bare entity seed (a
+    component, parameter, failure mode -- never a page itself) has no
+    outgoing edges, so if GROUND_ENTITY_SEEDS is on it gets exactly ONE
+    lookup of its own incoming edge to find its home document -- then
+    every hop after that is outgoing-only again.
+    """
+    edges, seen, visited = [], set(), {n: (0, s) for n, _l, s, _p in seeds}
+    frontier = [n for n, _l, _s, _p in seeds]
+    grounded = set()
+
+    for hop in range(1, MAX_HOPS + 1):
+        if not frontier or len(edges) >= MAX_EDGES:
+            break
+
+        block = _values_block(frontier[:MAX_FRONTIER])
+        rows = []
+        if block:
+            try:
+                rows = list(g.query(NEIGHBOUR_QUERY_TMPL.replace("%SEEDS%", block)))
+            except Exception as e:
+                print(f"  hop {hop} outgoing query failed: {e}")
+
+        if GROUND_ENTITY_SEEDS and hop == 1:
+            had_outgoing = {str(r.src) for r in rows}
+            needs_grounding = [
+                n for n in frontier
+                if n not in had_outgoing and n not in CONTENT_NODES and n not in grounded
+            ]
+            if needs_grounding:
+                gblock = _values_block(needs_grounding[:MAX_FRONTIER])
+                if gblock:
+                    try:
+                        grows = list(g.query(GROUNDING_QUERY_TMPL.replace("%SEEDS%", gblock)))
+                        # keep only rows whose source is a real document --
+                        # never chase the entity's OTHER incoming edges
+                        rows += [r for r in grows if str(r.src) in CONTENT_NODES]
+                    except Exception as e:
+                        print(f"  hop {hop} grounding query failed: {e}")
+                grounded.update(needs_grounding)
+
+        next_frontier = []
+        for row in rows:
+            # seed_score: max() of both sides matters ONLY for grounding
+            # rows (src not yet visited there) -- for ordinary outgoing
+            # rows src is already visited and this is a no-op. See header.
+            src, tgt, edge = _row_to_edge(
+                row, hop,
+                max(visited.get(str(row.src), (0, 0))[1],
+                    visited.get(str(row.tgt), (0, 0))[1]),
+            )
+            key = (edge["source"], edge["predicate"], edge["target"])
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append(edge)
+
+            # both sides checked: for ordinary outgoing rows this is a
+            # no-op on src (already visited); for grounding rows this is
+            # what actually enrolls the newly-found home document into
+            # next hop's frontier. See header.
+            for other in (src, tgt):
+                if other not in visited:
+                    visited[other] = (hop, edge["seed_score"])
+                    next_frontier.append(other)
+
+            if len(edges) >= MAX_EDGES:
+                break
+
+        frontier = next_frontier
+
+    return edges, visited
+
+
+print("Defined: link_entities, lexical_fallback, traverse (outgoing-only)")
