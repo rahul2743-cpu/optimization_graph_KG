@@ -1,0 +1,110 @@
+# ==========================================================
+# Cell 16d : PYVIS VISUALIZATION OF TRAVERSAL
+#
+#   Renders the exact edges/visited produced by traverse(seeds) in
+#   your diagnostic cell above -- same direction-inference logic
+#   (OUTGOING = seed -> new, INCOMING = grounding hit, new -> seed).
+#   Nothing is recomputed here; this only draws what already ran.
+# ==========================================================
+%pip install pyvis -q
+
+from pyvis.network import Network
+import html as _html
+
+print("=" * 80)
+print("CELL 16d — PYVIS GRAPH")
+print("=" * 80)
+
+net = Network(
+    height="750px", width="100%",
+    directed=True, notebook=False,
+    bgcolor="#111827", font_color="white"
+)
+net.barnes_hut(gravity=-3000, central_gravity=0.3,
+                spring_length=140, spring_strength=0.02, damping=0.9)
+
+seed_uris = {n for n, _l, _s, _p in seeds}
+
+def _node_color(uri):
+    if uri in seed_uris:
+        return "#FF6B6B"          # seed = red
+    if uri in CONTENT_NODES:
+        return "#4DABF7"          # document = blue
+    return "#51CF66"              # bare entity = green
+
+def _node_hop(uri):
+    return visited.get(uri, (None, None))[0]
+
+def _add_node(uri):
+    if uri in net.get_nodes():
+        return
+    label = NODE_LABEL.get(uri, uri)
+    hop = _node_hop(uri)
+    is_doc = uri in CONTENT_NODES
+    net.add_node(
+        uri,
+        label=(label[:40] + "…") if len(label) > 40 else label,
+        title=_html.escape(f"{label}\nhop: {hop}\ntype: {'document' if is_doc else 'entity'}"),
+        color=_node_color(uri),
+        shape="box" if is_doc else "dot",
+        size=30 if uri in seed_uris else (22 if is_doc else 14),
+    )
+
+# ---- add every node first, then every edge, with the SAME
+#      direction-inference logic as your diagnostic cell ----
+for e in edges:
+    _add_node(e["source"])
+    _add_node(e["target"])
+
+for e in edges:
+    src_hop = visited.get(e["source"], (None, None))[0]
+    tgt_hop = visited.get(e["target"], (None, None))[0]
+    edge_hop = e["hop"]
+
+    if src_hop is not None and src_hop == edge_hop - 1:
+        direction = "OUTGOING"          # seed/frontier -> new
+        edge_color = "#69DB7C"
+    elif tgt_hop is not None and tgt_hop == edge_hop - 1:
+        direction = "INCOMING"          # grounding hit: new -> seed
+        edge_color = "#FFA94D"
+    else:
+        direction = "UNKNOWN"
+        edge_color = "#ADB5BD"
+
+    net.add_edge(
+        e["source"], e["target"],
+        label=e["predicate"],
+        title=_html.escape(
+            f"{e['source_label']} --[{e['predicate']}, strength {e['strength']}]--> "
+            f"{e['target_label']}\n"
+            f"hop: {e['hop']}  |  direction: {direction}\n"
+            f"{e.get('description','')}"
+        ),
+        color=edge_color,
+        arrows="to",
+        width=1 + e["strength"] / 3,
+    )
+
+# ---- legend as floating HTML nodes (visual key, not real graph data) ----
+net.set_options("""
+{
+  "physics": {"stabilization": {"iterations": 150}},
+  "edges": {"font": {"size": 11, "color": "#ffffff", "strokeWidth": 0}}
+}
+""")
+
+OUT_PATH = "/tmp/kg_traversal.html"
+net.write_html(OUT_PATH, notebook=False)
+
+print(f"Nodes drawn : {len(net.get_nodes())}")
+print(f"Edges drawn : {len(net.get_edges())}")
+print(f"Saved       : {OUT_PATH}")
+print("Legend: RED=seed | BLUE box=document | GREEN dot=entity")
+print("        GREEN edge=OUTGOING | ORANGE edge=INCOMING(grounding) | GRAY=UNKNOWN")
+
+# ---- render inline ----
+try:
+    displayHTML(open(OUT_PATH, "r", encoding="utf-8").read())   # Databricks
+except NameError:
+    from IPython.display import IFrame, display
+    display(IFrame(src=OUT_PATH, width="100%", height="750px"))  # local Jupyter
